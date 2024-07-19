@@ -1,0 +1,1194 @@
+---
+title: "Rapamycin Main Effect by Sex-Tissue-mtDNA combination"
+output:
+  html_document:
+    toc: true
+params:
+   FDR: 0.05
+   LFC: 0.0
+date: "2023-10-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+FDR.Thresh <- params$FDR
+LFC.Thresh <- params$LFC
+set.seed(1234)
+```
+
+## Load packages.
+This document depends on the following packages:
+```{r, message=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(apeglm)
+library(eulerr)
+library(EnhancedVolcano)
+library(flybaseR)
+library(drosophila2.db)
+library("org.Dm.eg.db")
+library(AnnotationDbi)
+library(repr)
+library(vsn)
+library(pheatmap)
+library(WGCNA)
+library(clusterProfiler)
+library(DEGreport)
+source("../edgeR/FBidsTOSymbol.R")
+library(RNAseqQC)
+library(ensembldb)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(magrittr)
+library(simplifyEnrichment)
+library(stats)
+library(msigdbr)
+library(GO.db)
+library(ggridges)
+library(enrichplot)
+library(ggupset)
+library(gplots)
+library(UpSetR)
+library(rrvgo)
+library(IHW)
+library(patchwork)
+```
+
+## Read count tables/group info into R.
+Acquiring data from the GitHub account:
+```{r data acquisition, GitHub}
+cts <- as.matrix(read.csv("C:/Users/yevge/Dropbox/Brown/Work/rapa_tissue/rapa_count_table.csv", row.names = 1))
+cts <- subset(cts, select = -OOFCH4) #remove OOFCH4
+
+coldata <- read.csv("C:/Users/yevge/Dropbox/Brown/Work/rapa_tissue/rapa_group_data.csv", row.names = 1)
+coldata <- coldata[colnames(cts),]
+
+coldata$Treatment <- as.factor(coldata$Treatment)
+coldata$Species <- as.factor(coldata$Species)
+coldata$Group <- as.factor(coldata$Group)
+coldata$GenoTreat <- as.factor(paste0(coldata$Species, substring(coldata$Treatment,1,3)))
+```
+
+## Female Heads
+
+```{r subset count data to female heads}
+
+cts_fh <- cts[,substring(colnames(cts), 3, 3)=="F" & substring(colnames(cts), 5, 5)=="H"] 
+coldata_fh <- coldata[colnames(cts_fh),]
+
+gene_universe_fh <- rownames(cts[rowSums(cts_fh)>0, ])
+length(gene_universe_fh)
+
+ifelse(!dir.exists("results/Female_Head"), dir.create("results/Female_Head", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_fh, "results/Female_Head/gene_universe_fh.txt")
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_fh) %in% colnames(cts_fh)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_fh) == colnames(cts_fh)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+```{r make a new DESeqDataSet for female heads}
+dds_fh <- DESeqDataSetFromMatrix(countData = cts_fh,
+                              colData = coldata_fh,
+                              design = ~ GenoTreat) #design matrix with no intercept
+
+keep <- rowSums(counts(dds_fh)) >= 1 #minimal pre-filtering
+summary(keep)
+dds_fh <- dds_fh[keep,]
+```
+
+### Differential expression analysis
+
+```{r differential expression analysis: female heads}
+dds_fh <- DESeq(dds_fh)
+# standard differential expression analysis steps are wrapped into a single function, DESeq: will perform normalization of the raw counts, estimate variances, and perform the differential expression tests
+resultsNames(dds_fh)
+```
+
+#### Treatment contrast in OO
+
+```{r differential expression for treatments effect CvsR in OO: female heads}
+res_CvsR_OO <- results(dds_fh, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh, 
+               contrast=c("GenoTreat","OORap","OOCon"), filterFun=ihw)
+summary(res_CvsR_OO)
+res_CvsR_OO_Ordered <- res_CvsR_OO[order(res_CvsR_OO$pvalue),]
+res_CvsR_OO_Sig <- subset(res_CvsR_OO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_OO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_OO")
+
+write.csv(res_CvsR_OO_Sig, "results/Female_Head/OOFCH-OOFRH.csv")
+rapa_OOFH <- rownames(res_CvsR_OO_Sig) #effect of rapa in OO heads
+```
+
+#### Treatment contrast in SO
+
+```{r differential expression for treatments effect CvsR in SO: female heads}
+res_CvsR_SO <- results(dds_fh, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+               contrast=c("GenoTreat","SORap","SOCon"), filterFun=ihw)
+summary(res_CvsR_SO)
+res_CvsR_SO_Ordered <- res_CvsR_SO[order(res_CvsR_SO$pvalue),]
+res_CvsR_SO_Sig <- subset(res_CvsR_SO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_SO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_SO")
+
+write.csv(res_CvsR_SO_Sig, "results/Female_Head/SOFCH-SOFRH.csv")
+rapa_SOFH <- rownames(res_CvsR_SO_Sig) #effect of rapa in SO heads
+```
+
+## Female Thorax
+
+```{r subset count data to female thorax}
+
+cts_ft <- cts[,substring(colnames(cts), 3, 3)=="F" & substring(colnames(cts), 5, 5)=="T"] 
+coldata_ft <- coldata[colnames(cts_ft),]
+
+gene_universe_ft <- rownames(cts[rowSums(cts_ft)>0, ])
+length(gene_universe_ft)
+
+ifelse(!dir.exists("results/Female_Thorax"), dir.create("results/Female_Thorax", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_ft, "results/Female_Thorax/gene_universe_ft.txt")
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_ft) %in% colnames(cts_ft)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_ft) == colnames(cts_ft)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+
+```{r make a new DESeqDataSet for female thorax}
+dds_ft <- DESeqDataSetFromMatrix(countData = cts_ft,
+                                 colData = coldata_ft,
+                                 design = ~ GenoTreat) #design matrix with no intercept
+
+keep <- rowSums(counts(dds_ft)) >= 1 #minimal pre-filtering
+dds_ft <- dds_ft[keep,]
+```
+
+### Differential expression analysis
+
+```{r differential expression analysis: female thorax}
+dds_ft <- DESeq(dds_ft)
+# standard differential expression analysis steps are wrapped into a single function, DESeq: will perform normalization of the raw counts, estimate variances, and perform the differential expression tests
+resultsNames(dds_ft)
+```
+
+#### Treatment contrast in OO
+
+```{r differential expression for treatments effect CvsR in OO: female thorax}
+res_CvsR_OO <- results(dds_ft, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","OORap","OOCon"), filterFun=ihw)
+summary(res_CvsR_OO)
+res_CvsR_OO_Ordered <- res_CvsR_OO[order(res_CvsR_OO$pvalue),]
+res_CvsR_OO_Sig <- subset(res_CvsR_OO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_OO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_OO")
+
+write.csv(res_CvsR_OO_Sig, "results/Female_Thorax/OOFCT-OOFRT.csv")
+rapa_OOFT <- rownames(res_CvsR_OO_Sig)
+```
+
+#### Treatment contrast in SO
+
+```{r differential expression for treatments effect CvsR in SO: female thorax}
+res_CvsR_SO <- results(dds_ft, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","SORap","SOCon"), filterFun=ihw)
+summary(res_CvsR_SO)
+res_CvsR_SO_Ordered <- res_CvsR_SO[order(res_CvsR_SO$pvalue),]
+res_CvsR_SO_Sig <- subset(res_CvsR_SO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_SO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_SO")
+
+write.csv(res_CvsR_SO_Sig, "results/Female_Thorax/SOFCT-SOFRT.csv")
+rapa_SOFT <- rownames(res_CvsR_SO_Sig)
+```
+
+## Female Abdomen
+
+```{r subset count data to female abdomen}
+
+cts_fa <- cts[,substring(colnames(cts), 3, 3)=="F" & substring(colnames(cts), 5, 5)=="A"] 
+coldata_fa <- coldata[colnames(cts_fa),]
+
+gene_universe_fa <- rownames(cts[rowSums(cts_fa)>0, ])
+length(gene_universe_fa)
+
+ifelse(!dir.exists("results/Female_Abdomen"), dir.create("results/Female_Abdomen", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_fa, "results/Female_Abdomen/gene_universe_fa.txt")
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_fa) %in% colnames(cts_fa)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_fa) == colnames(cts_fa)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+
+```{r make a new DESeqDataSet for female abdomen}
+dds_fa <- DESeqDataSetFromMatrix(countData = cts_fa,
+                                 colData = coldata_fa,
+                                 design = ~ GenoTreat) #design matrix with no intercept
+
+keep <- rowSums(counts(dds_fa)) >= 1 #minimal pre-filtering
+dds_fa <- dds_fa[keep,]
+```
+
+### Differential expression analysis
+
+```{r differential expression analysis: female abdomen}
+dds_fa <- DESeq(dds_fa)
+# standard differential expression analysis steps are wrapped into a single function, DESeq: will perform normalization of the raw counts, estimate variances, and perform the differential expression tests
+resultsNames(dds_fa)
+```
+
+#### Treatment contrast in OO
+
+```{r differential expression for treatments effect CvsR in OO: female abdomen}
+res_CvsR_OO <- results(dds_fa, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","OORap","OOCon"), filterFun=ihw)
+summary(res_CvsR_OO)
+res_CvsR_OO_Ordered <- res_CvsR_OO[order(res_CvsR_OO$pvalue),]
+res_CvsR_OO_Sig <- subset(res_CvsR_OO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_OO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_OO")
+
+write.csv(res_CvsR_OO_Sig, "results/Female_Abdomen/OOFCA-OOFRA.csv")
+rapa_OOFA <- rownames(res_CvsR_OO_Sig)
+```
+
+#### Treatment contrast in SO
+
+```{r differential expression for treatments effect CvsR in SO: female abdomen}
+res_CvsR_SO <- results(dds_fa, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","SORap","SOCon"), filterFun=ihw)
+summary(res_CvsR_SO)
+res_CvsR_SO_Ordered <- res_CvsR_SO[order(res_CvsR_SO$pvalue),]
+res_CvsR_SO_Sig <- subset(res_CvsR_SO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_SO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_SO")
+
+write.csv(res_CvsR_SO_Sig, "results/Female_Abdomen/SOFCA-SOFRA.csv")
+rapa_SOFA <- rownames(res_CvsR_SO_Sig)
+```
+
+## Male Heads
+
+```{r subset count data to male heads}
+
+cts_mh <- cts[,substring(colnames(cts), 3, 3)=="M" & substring(colnames(cts), 5, 5)=="H"] 
+coldata_mh <- coldata[colnames(cts_mh),]
+
+gene_universe_mh <- rownames(cts[rowSums(cts_mh)>0, ])
+length(gene_universe_mh)
+
+ifelse(!dir.exists("results/Male_Head"), dir.create("results/Male_Head", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_mh, "results/Male_Head/gene_universe_mh.txt")
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_mh) %in% colnames(cts_mh)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_mh) == colnames(cts_mh)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+```{r make a new DESeqDataSet for male heads}
+dds_mh <- DESeqDataSetFromMatrix(countData = cts_mh,
+                                 colData = coldata_mh,
+                                 design = ~ GenoTreat) #design matrix with no intercept
+
+keep <- rowSums(counts(dds_mh)) >= 1 #minimal pre-filtering
+dds_mh <- dds_mh[keep,]
+```
+
+### Differential expression analysis
+
+```{r differential expression analysis: male heads}
+dds_mh <- DESeq(dds_mh)
+# standard differential expression analysis steps are wrapped into a single function, DESeq: will perform normalization of the raw counts, estimate variances, and perform the differential expression tests
+resultsNames(dds_mh)
+```
+
+#### Treatment contrast in OO
+
+```{r differential expression for treatments effect CvsR in OO: male heads}
+res_CvsR_OO <- results(dds_mh, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","OORap","OOCon"), filterFun=ihw)
+summary(res_CvsR_OO)
+res_CvsR_OO_Ordered <- res_CvsR_OO[order(res_CvsR_OO$pvalue),]
+res_CvsR_OO_Sig <- subset(res_CvsR_OO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_OO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_OO")
+
+write.csv(res_CvsR_OO_Sig, "results/Male_Head/OOMCH-OOMRH.csv")
+rapa_OOMH <- rownames(res_CvsR_OO_Sig)
+```
+
+#### Treatment contrast in SO
+
+```{r differential expression for treatments effect CvsR in SO: male heads}
+res_CvsR_SO <- results(dds_mh, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","SORap","SOCon"), filterFun=ihw)
+summary(res_CvsR_SO)
+res_CvsR_SO_Ordered <- res_CvsR_SO[order(res_CvsR_SO$pvalue),]
+res_CvsR_SO_Sig <- subset(res_CvsR_SO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_SO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_SO")
+
+write.csv(res_CvsR_SO_Sig, "results/Male_Head/SOMCH-SOMRH.csv")
+rapa_SOMH <- rownames(res_CvsR_SO_Sig)
+```
+
+## Male Thorax
+
+```{r subset count data to male thorax}
+
+cts_mt <- cts[,substring(colnames(cts), 3, 3)=="M" & substring(colnames(cts), 5, 5)=="T"] 
+coldata_mt <- coldata[colnames(cts_mt),]
+
+gene_universe_mt <- rownames(cts[rowSums(cts_mt)>0, ])
+length(gene_universe_mt)
+
+ifelse(!dir.exists("results/Male_Thorax"), dir.create("results/Male_Thorax", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_mt, "results/Male_Thorax/gene_universe_mt.txt")
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_mt) %in% colnames(cts_mt)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_mt) == colnames(cts_mt)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+
+```{r make a new DESeqDataSet for male thorax}
+dds_mt <- DESeqDataSetFromMatrix(countData = cts_mt,
+                                 colData = coldata_mt,
+                                 design = ~ GenoTreat) #design matrix with no intercept
+
+keep <- rowSums(counts(dds_mt)) >= 1 #minimal pre-filtering
+dds_mt <- dds_mt[keep,]
+```
+
+### Differential expression analysis
+
+```{r differential expression analysis: male thorax}
+dds_mt <- DESeq(dds_mt)
+# standard differential expression analysis steps are wrapped into a single function, DESeq: will perform normalization of the raw counts, estimate variances, and perform the differential expression tests
+resultsNames(dds_mt)
+```
+
+#### Treatment contrast in OO
+
+```{r differential expression for treatments effect CvsR in OO: male thorax}
+res_CvsR_OO <- results(dds_mt, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","OORap","OOCon"), filterFun=ihw)
+summary(res_CvsR_OO)
+res_CvsR_OO_Ordered <- res_CvsR_OO[order(res_CvsR_OO$pvalue),]
+res_CvsR_OO_Sig <- subset(res_CvsR_OO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_OO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_OO")
+
+write.csv(res_CvsR_OO_Sig, "results/Male_Thorax/OOMCT-OOMRT.csv")
+rapa_OOMT <- rownames(res_CvsR_OO_Sig)
+```
+
+#### Treatment contrast in SO
+
+```{r differential expression for treatments effect CvsR in SO: male thorax}
+res_CvsR_SO <- results(dds_mt, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","SORap","SOCon"), filterFun=ihw)
+summary(res_CvsR_SO)
+res_CvsR_SO_Ordered <- res_CvsR_SO[order(res_CvsR_SO$pvalue),]
+res_CvsR_SO_Sig <- subset(res_CvsR_SO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_SO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_SO")
+
+write.csv(res_CvsR_SO_Sig, "results/Male_Thorax/SOMCT-SOMRT.csv")
+rapa_SOMT <- rownames(res_CvsR_SO_Sig)
+```
+
+## Male Abdomen
+
+```{r subset count data to male abdomen}
+
+cts_ma <- cts[,substring(colnames(cts), 3, 3)=="M" & substring(colnames(cts), 5, 5)=="A"] 
+coldata_ma <- coldata[colnames(cts_ma),]
+
+gene_universe_ma <- rownames(cts[rowSums(cts_ma)>0, ])
+length(gene_universe_ma)
+
+ifelse(!dir.exists("results/Male_Abdomen"), dir.create("results/Male_Abdomen", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_ma, "results/Male_Abdomen/gene_universe_ma.txt")
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_ma) %in% colnames(cts_ma)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_ma) == colnames(cts_ma)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+
+```{r make a new DESeqDataSet for male abdomen}
+dds_ma <- DESeqDataSetFromMatrix(countData = cts_ma,
+                                 colData = coldata_ma,
+                                 design = ~ GenoTreat) #design matrix with no intercept
+
+keep <- rowSums(counts(dds_ma)) >= 1 #minimal pre-filtering
+dds_ma <- dds_ma[keep,]
+```
+
+### Differential expression analysis
+
+```{r differential expression analysis: male abdomen}
+dds_ma <- DESeq(dds_ma)
+# standard differential expression analysis steps are wrapped into a single function, DESeq: will perform normalization of the raw counts, estimate variances, and perform the differential expression tests
+resultsNames(dds_ma)
+```
+
+#### Treatment contrast in OO
+
+```{r differential expression for treatments effect CvsR in OO: male abdomen}
+res_CvsR_OO <- results(dds_ma, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","OORap","OOCon"), filterFun=ihw)
+summary(res_CvsR_OO)
+res_CvsR_OO_Ordered <- res_CvsR_OO[order(res_CvsR_OO$pvalue),]
+res_CvsR_OO_Sig <- subset(res_CvsR_OO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_OO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_OO")
+
+write.csv(res_CvsR_OO_Sig, "results/Male_Abdomen/OOMCA-OOMRA.csv")
+rapa_OOMA <- rownames(res_CvsR_OO_Sig)
+```
+
+#### Treatment contrast in SO
+
+```{r differential expression for treatments effect CvsR in SO: male abdomen}
+res_CvsR_SO <- results(dds_ma, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,
+                       contrast=c("GenoTreat","SORap","SOCon"), filterFun=ihw)
+summary(res_CvsR_SO)
+res_CvsR_SO_Ordered <- res_CvsR_SO[order(res_CvsR_SO$pvalue),]
+res_CvsR_SO_Sig <- subset(res_CvsR_SO_Ordered, padj < FDR.Thresh)
+hist(res_CvsR_SO$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_CvsR_SO")
+
+write.csv(res_CvsR_SO_Sig, "results/Male_Abdomen/SOMCA-SOMRA.csv")
+rapa_SOMA <- rownames(res_CvsR_SO_Sig)
+```
+
+
+## Treatment effects
+
+```{r DEG names CvR/FEMALES}
+#extract upregulated and downregulated DEG names in OO and SO mtDNA backgrounds for each of the 3 different tissues
+
+UP_rapa_OOFH <- rownames(OOFCH_OOFRH[OOFCH_OOFRH$log2FoldChange>0,])
+DOWN_rapa_OOFH <- rownames(OOFCH_OOFRH[OOFCH_OOFRH$log2FoldChange<0,])
+
+UP_rapa_OOFT <- rownames(OOFCT_OOFRT[OOFCT_OOFRT$log2FoldChange>0,])
+DOWN_rapa_OOFT <- rownames(OOFCT_OOFRT[OOFCT_OOFRT$log2FoldChange<0,])
+
+UP_rapa_OOFA <- rownames(OOFCA_OOFRA[OOFCA_OOFRA$log2FoldChange>0,])
+DOWN_rapa_OOFA <- rownames(OOFCA_OOFRA[OOFCA_OOFRA$log2FoldChange<0,])
+
+UP_rapa_SOFH <- rownames(SOFCH_SOFRH[SOFCH_SOFRH$log2FoldChange>0,])
+DOWN_rapa_SOFH <- rownames(SOFCH_SOFRH[SOFCH_SOFRH$log2FoldChange<0,])
+
+UP_rapa_SOFT <- rownames(SOFCT_SOFRT[SOFCT_SOFRT$log2FoldChange>0,])
+DOWN_rapa_SOFT <- rownames(SOFCT_SOFRT[SOFCT_SOFRT$log2FoldChange<0,])
+
+UP_rapa_SOFA <- rownames(SOFCA_SOFRA[SOFCA_SOFRA$log2FoldChange>0,])
+DOWN_rapa_SOFA <- rownames(SOFCA_SOFRA[SOFCA_SOFRA$log2FoldChange<0,])
+```
+
+
+
+```{r DEG names CvR/MALES}
+#extract upregulated and downregulated DEG names in OO and SO mtDNA backgrounds for each of the 3 different tissues
+
+UP_rapa_OOMH <- rownames(OOMCH_OOMRH[OOMCH_OOMRH$log2FoldChange>0,])
+DOWN_rapa_OOMH <- rownames(OOMCH_OOMRH[OOMCH_OOMRH$log2FoldChange<0,])
+
+UP_rapa_OOMT <- rownames(OOMCT_OOMRT[OOMCT_OOMRT$log2FoldChange>0,])
+DOWN_rapa_OOMT <- rownames(OOMCT_OOMRT[OOMCT_OOMRT$log2FoldChange<0,])
+
+UP_rapa_OOMA <- rownames(OOMCA_OOMRA[OOMCA_OOMRA$log2FoldChange>0,])
+DOWN_rapa_OOMA <- rownames(OOMCA_OOMRA[OOMCA_OOMRA$log2FoldChange<0,])
+
+UP_rapa_SOMH <- rownames(SOMCH_SOMRH[SOMCH_SOMRH$log2FoldChange>0,])
+DOWN_rapa_SOMH <- rownames(SOMCH_SOMRH[SOMCH_SOMRH$log2FoldChange<0,])
+
+UP_rapa_SOMT <- rownames(SOMCT_SOMRT[SOMCT_SOMRT$log2FoldChange>0,])
+DOWN_rapa_SOMT <- rownames(SOMCT_SOMRT[SOMCT_SOMRT$log2FoldChange<0,])
+
+UP_rapa_SOMA <- rownames(SOMCA_SOMRA[SOMCA_SOMRA$log2FoldChange>0,])
+DOWN_rapa_SOMA <- rownames(SOMCA_SOMRA[SOMCA_SOMRA$log2FoldChange<0,])
+```
+
+## Intersections
+
+```{r}
+FH <- list("OO"=rapa_OOFH, "SO" = rapa_SOFH)
+FHplot <- plot(euler(FH),main = "Female HEADS", quantities = TRUE)
+
+FT <- list("OO"=rapa_OOFT, "SO" = rapa_SOFT)
+FTplot <- plot(euler(FT),main = "Female THORAX", quantities = TRUE)
+
+FA <- list("OO"=rapa_OOFA, "SO" = rapa_SOFA)
+FAplot <- plot(euler(FA),main = "Female ABDOMEN", quantities = TRUE)
+
+MH <- list("OO"=rapa_OOMH, "SO" = rapa_SOMH)
+MHplot <- plot(euler(MH),main = "Male HEADS", quantities = TRUE)
+
+MT <- list("OO"=rapa_OOMT, "SO" = rapa_SOMT)
+MTplot <- plot(euler(MT),main = "Male THORAX", quantities = TRUE)
+
+MA <- list("OO"=rapa_OOMA, "SO" = rapa_SOMA)
+MAplot <- plot(euler(MA),main = "Male ABDOMEN", quantities = TRUE,
+               area_col = c("#FF0000", "#00FF00", "black"))
+
+
+cowplot::plot_grid(FHplot, FTplot, FAplot, MHplot, MTplot, MAplot, ncol=3)
+```
+
+
+```{r}
+
+FH <- c("Shared" = length(intersect(rapa_OOFH, rapa_SOFH)), "OreR;OreR private" = length(setdiff(rapa_OOFH, rapa_SOFH)), "sm21;OreR private" = length(setdiff(rapa_SOFH, rapa_OOFH)))
+
+FT <- c("Shared" = length(intersect(rapa_OOFT, rapa_SOFT)), "OreR;OreR private" = length(setdiff(rapa_OOFT, rapa_SOFT)), "sm21;OreR private" = length(setdiff(rapa_SOFT, rapa_OOFT)))
+
+FA <- c("Shared" = length(intersect(rapa_OOFA, rapa_SOFA)), "OreR;OreR private" = length(setdiff(rapa_OOFA, rapa_SOFA)), "sm21;OreR private" = length(setdiff(rapa_SOFA, rapa_OOFA)))
+
+MH <- c("Shared" = length(intersect(rapa_OOMH, rapa_SOMH)), "OreR;OreR private" = length(setdiff(rapa_OOMH, rapa_SOMH)), "sm21;OreR private" = length(setdiff(rapa_SOMH, rapa_OOMH)))
+
+MT <- c("Shared" = length(intersect(rapa_OOMT, rapa_SOMT)), "OreR;OreR private" = length(setdiff(rapa_OOMT, rapa_SOMT)), "sm21;OreR private" = length(setdiff(rapa_SOMT, rapa_OOMT)))
+
+MA <- c("Shared" = length(intersect(rapa_OOMA, rapa_SOMA)), "OreR;OreR private" = length(setdiff(rapa_OOMA, rapa_SOMA)), "sm21;OreR private" = length(setdiff(rapa_SOMA, rapa_OOMA)))
+
+gene_counts <- cbind(as.data.frame(FH),as.data.frame(FT), as.data.frame(FA), 
+              as.data.frame(MH),as.data.frame(MT), as.data.frame(MA)) %>% 
+  t() %>% as.data.frame() %>% 
+  mutate(Sample=row.names(.))
+
+gene_counts <- pivot_longer(gene_counts, cols = all_of(c("Shared", "OreR;OreR private", "sm21;OreR private")), names_to = "Type", values_to = "Count")
+gene_counts$Sex <- substr(gene_counts$Sample, 1,1)
+gene_counts$Tissue <- substr(gene_counts$Sample, 2,2)
+gene_counts <- gene_counts %>%
+  mutate(Sex = ifelse(Sex=="F", "Female", "Male"))
+
+gene_counts <- gene_counts %>%
+  mutate(Tissue = ifelse(Tissue=="T", "Thorax", 
+                         ifelse(Tissue=="A", "Abdomen", "Head")))
+gene_counts$SexTissue <- paste(gene_counts$Sex, gene_counts$Tissue, sep = "\n")
+
+Barplot <- ggplot(gene_counts, aes(x = SexTissue, y = Count, fill = Type)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Tissue", y = "DEG Count")+
+  geom_text(aes(label = Count), position=position_stack(vjust=0.5), color = "black", size = 6) +
+        theme(axis.text.x = element_text(size = 14),  
+              axis.text.y = element_text(size = 14)) +    theme(axis.title.y = element_text(size = 14)) + theme(plot.title = element_text(size = 16), legend.text = element_text(size=11))
+
+```
+
+```{r, fig.width=7, fig.height=7}
+
+colors <- c("sm21;OreR private" = "#377eb8", "OreR;OreR private" = "#e41a1c", "Shared" = "#984ea3")
+Barplot <- ggplot(gene_counts, aes(x = SexTissue, y = Count, fill = Type)) +
+  geom_bar(stat = "identity", color = "black", width = 0.7) +
+  geom_text(aes(label = Count), position = position_stack(vjust = 0.5), color = "black", size = 5) +
+  
+  scale_fill_manual(values = colors) +  # Use the defined color palette
+
+  
+  
+  labs(x = "Tissue", y = "DEG Count", fill = "DEG Type") +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +
+  
+  theme(
+    axis.text.x = element_text(size = 14, angle = 45, hjust = 1),  
+    axis.text.y = element_text(size = 14),
+    #axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16),
+    legend.text = element_text(size = 11),
+    legend.position = "top",
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) 
+Barplot
+ggsave("barplot_rapa_effect_by_mito.pdf", 
+       Barplot,
+       width = 7,
+       height = 5)
+```
+
+
+
+## Rapa GO analysis in females
+
+
+```{r rapa GO analysis females}
+
+#OO Female head
+
+GO_rapa_OOFH <- simplify(enrichGO(rapa_OOFH, OrgDb=drosophila2.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOFH_UP <- simplify(enrichGO(UP_rapa_OOFH, OrgDb=drosophila2.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOFH_DOWN <- simplify(enrichGO(DOWN_rapa_OOFH, OrgDb=drosophila2.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP"))
+
+
+#OO Female thorax
+
+GO_rapa_OOFT <- simplify(enrichGO(rapa_OOFT, OrgDb=drosophila2.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOFT_UP <- simplify(enrichGO(UP_rapa_OOFT, OrgDb=drosophila2.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOFT_DOWN <- simplify(enrichGO(DOWN_rapa_OOFT, OrgDb=drosophila2.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP"))
+
+#OO Female abdomen
+
+GO_rapa_OOFA <- simplify(enrichGO(rapa_OOFA, OrgDb=drosophila2.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOFA_UP <- simplify(enrichGO(UP_rapa_OOFA, OrgDb=drosophila2.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOFA_DOWN <- simplify(enrichGO(DOWN_rapa_OOFA, OrgDb=drosophila2.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP"))
+
+#SO Female head
+
+GO_rapa_SOFH <- simplify(enrichGO(rapa_SOFH, OrgDb=drosophila2.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOFH_UP <- simplify(enrichGO(UP_rapa_SOFH, OrgDb=drosophila2.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOFH_DOWN <- simplify(enrichGO(DOWN_rapa_SOFH, OrgDb=drosophila2.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP"))
+
+#SO Female thorax
+
+GO_rapa_SOFT <- simplify(enrichGO(rapa_SOFT, OrgDb=drosophila2.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOFT_UP <- simplify(enrichGO(UP_rapa_SOFT, OrgDb=drosophila2.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOFT_DOWN <- simplify(enrichGO(DOWN_rapa_SOFT, OrgDb=drosophila2.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP"))
+
+#SO Female abdomen
+
+GO_rapa_SOFA <- simplify(enrichGO(rapa_SOFA, OrgDb=drosophila2.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOFA_UP <- simplify(enrichGO(UP_rapa_SOFA, OrgDb=drosophila2.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOFA_DOWN <- simplify(enrichGO(DOWN_rapa_SOFA, OrgDb=drosophila2.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP"))
+
+
+write.csv(GO_rapa_OOFH_UP, "results/Female_Head/GO_rapa_OOFH_UP.csv")
+write.csv(GO_rapa_OOFH_DOWN, "results/Female_Head/GO_rapa_OOFH_DOWN.csv")
+write.csv(GO_rapa_OOFT_UP, "results/Female_Thorax/GO_rapa_OOFT_UP.csv")
+write.csv(GO_rapa_OOFT_DOWN, "results/Female_Thorax/GO_rapa_OOFT_DOWN.csv")
+write.csv(GO_rapa_OOFA_UP, "results/Female_Abdomen/GO_rapa_OOFA_UP.csv")
+write.csv(GO_rapa_OOFA_DOWN, "results/Female_Abdomen/GO_rapa_OOFA_DOWN.csv")
+
+write.csv(GO_rapa_SOFH_UP, "results/Female_Head/GO_rapa_SOFH_UP.csv")
+write.csv(GO_rapa_SOFH_DOWN, "results/Female_Head/GO_rapa_SOFH_DOWN.csv")
+write.csv(GO_rapa_SOFT_UP, "results/Female_Thorax/GO_rapa_SOFT_UP.csv")
+write.csv(GO_rapa_SOFT_DOWN, "results/Female_Thorax/GO_rapa_SOFT_DOWN.csv")
+write.csv(GO_rapa_SOFA_UP, "results/Female_Abdomen/GO_rapa_SOFA_UP.csv")
+write.csv(GO_rapa_SOFA_DOWN, "results/Female_Abdomen/GO_rapa_SOFA_DOWN.csv")
+```
+
+### Rapa GO plots for females
+
+```{r rapa GO ggplots females}
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+#OO Female head
+
+fem_hdOO <- as.data.frame(GO_rapa_OOFH_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_OOFH_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+fem_hdOO
+
+
+#OO Female thorax
+
+fem_thOO <- as.data.frame(GO_rapa_OOFT_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_OOFT_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+fem_thOO
+
+#OO Female abdomen
+
+fem_abOO <- as.data.frame(GO_rapa_OOFA_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_OOFA_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+fem_abOO
+
+
+#SO Female head
+
+fem_hdSO <- as.data.frame(GO_rapa_SOFH_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_SOFH_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+fem_hdSO
+
+
+#SO Female thorax
+
+fem_thSO <- as.data.frame(GO_rapa_SOFT_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_SOFT_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+fem_thSO
+
+#SO Female abdomen
+
+fem_abSO <- as.data.frame(GO_rapa_SOFA_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_SOFA_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+fem_abSO
+```
+
+## Rapa GO analysis in males
+
+```{r rapa GO analysis males}
+
+#OO Male head
+
+GO_rapa_OOMH <- simplify(enrichGO(rapa_OOMH, OrgDb=drosophila2.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOMH_UP <- simplify(enrichGO(UP_rapa_OOMH, OrgDb=drosophila2.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOMH_DOWN <- simplify(enrichGO(DOWN_rapa_OOMH, OrgDb=drosophila2.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP"))
+
+#OO Male thorax
+
+GO_rapa_OOMT <- simplify(enrichGO(rapa_OOMT, OrgDb=drosophila2.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOMT_UP <- simplify(enrichGO(UP_rapa_OOMT, OrgDb=drosophila2.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOMT_DOWN <- simplify(enrichGO(DOWN_rapa_OOMT, OrgDb=drosophila2.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP"))
+
+##OO Male abdomen
+
+GO_rapa_OOMA <- simplify(enrichGO(rapa_OOMA, OrgDb=drosophila2.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOMA_UP <- simplify(enrichGO(UP_rapa_OOMA, OrgDb=drosophila2.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_OOMA_DOWN <- simplify(enrichGO(DOWN_rapa_OOMA, OrgDb=drosophila2.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP"))
+
+#SO Male head
+
+GO_rapa_SOMH <- simplify(enrichGO(rapa_SOMH, OrgDb=drosophila2.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOMH_UP <- simplify(enrichGO(UP_rapa_SOMH, OrgDb=drosophila2.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOMH_DOWN <- simplify(enrichGO(DOWN_rapa_SOMH, OrgDb=drosophila2.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP"))
+
+#SO Male thorax
+
+GO_rapa_SOMT <- simplify(enrichGO(rapa_SOMT, OrgDb=drosophila2.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOMT_UP <- simplify(enrichGO(UP_rapa_SOMT, OrgDb=drosophila2.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOMT_DOWN <- simplify(enrichGO(DOWN_rapa_SOMT, OrgDb=drosophila2.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP"))
+
+#SO Male abdomen
+
+GO_rapa_SOMA <- simplify(enrichGO(rapa_SOMA, OrgDb=drosophila2.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOMA_UP <- simplify(enrichGO(UP_rapa_SOMA, OrgDb=drosophila2.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP"))
+GO_rapa_SOMA_DOWN <- simplify(enrichGO(DOWN_rapa_SOMA, OrgDb=drosophila2.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP"))
+
+
+write.csv(GO_rapa_OOMH_UP, "results/Male_Head/GO_rapa_OOMH_UP.csv")
+write.csv(GO_rapa_OOMH_DOWN, "results/Male_Head/GO_rapa_OOMH_DOWN.csv")
+write.csv(GO_rapa_OOMT_UP, "results/Male_Thorax/GO_rapa_OOMT_UP.csv")
+write.csv(GO_rapa_OOMT_DOWN, "results/Male_Thorax/GO_rapa_OOMT_DOWN.csv")
+write.csv(GO_rapa_OOMA_UP, "results/Male_Abdomen/GO_rapa_OOMA_UP.csv")
+write.csv(GO_rapa_OOMA_DOWN, "results/Male_Abdomen/GO_rapa_OOMA_DOWN.csv")
+
+write.csv(GO_rapa_SOMH_UP, "results/Male_Head/GO_rapa_SOMH_UP.csv")
+write.csv(GO_rapa_SOMH_DOWN, "results/Male_Head/GO_rapa_SOMH_DOWN.csv")
+write.csv(GO_rapa_SOMT_UP, "results/Male_Thorax/GO_rapa_SOMT_UP.csv")
+write.csv(GO_rapa_SOMT_DOWN, "results/Male_Thorax/GO_rapa_SOMT_DOWN.csv")
+write.csv(GO_rapa_SOMA_UP, "results/Male_Abdomen/GO_rapa_SOMA_UP.csv")
+write.csv(GO_rapa_SOMA_DOWN, "results/Male_Abdomen/GO_rapa_SOMA_DOWN.csv")
+```
+
+### Rapa GO plots for males
+
+```{r rapa GO ggplots males}
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+#OO Male head
+
+mal_hdOO <- as.data.frame(GO_rapa_OOMH_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_OOMH_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+mal_hdOO
+
+
+#OO Male thorax
+
+mal_thOO <- as.data.frame(GO_rapa_OOMT_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_OOMT_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+mal_thOO
+
+#OO Male abdomen
+
+mal_abOO <- as.data.frame(GO_rapa_OOMA_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_OOMA_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+mal_abOO
+
+
+#SO Male head
+
+mal_hdSO <- as.data.frame(GO_rapa_SOMH_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_SOMH_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+mal_hdSO
+
+
+#SO Male thorax
+
+mal_thSO <- as.data.frame(GO_rapa_SOMT_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_SOMT_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+mal_thSO
+
+#SO Male abdomen
+
+mal_abSO <- as.data.frame(GO_rapa_SOMA_UP) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n=10)%>%
+  bind_rows(as.data.frame(GO_rapa_SOMA_DOWN)  %>% 
+              slice_min(p.adjust, n=10)%>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated',-1,1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+   
+  mutate(Descr=str_wrap(Description, width = 30))%>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = colp)+
+  ylab('log10 FDR')+ xlab('Ontology') +
+  coord_flip()+
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(size = 20),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 18),  # Increase font size for y-axis
+    axis.title.y = element_text(size = 20),  # Increase font size for y-axis title
+    axis.title.x = element_text(size = 20),  # Increase font size for x-axis title
+    plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 17),  # Increase font size for legend text
+  ) 
+mal_abSO
+```
+## Make one Excel file with GO results
+
+```{r, make one excel file}
+wb <- createWorkbook()
+
+dfs <- list(Fem_Head_OO_UP = GO_rapa_OOFH_UP,
+Fem_Head_OO_DOWN = GO_rapa_OOFH_DOWN, 
+Fem_Thorax_OO_UP = GO_rapa_OOFT_UP, 
+Fem_Thorax_OO_DOWN = GO_rapa_OOFT_DOWN, 
+Fem_Abdomen_OO_UP = GO_rapa_OOFA_UP, 
+Fem_Abdomen_OO_DOWN = GO_rapa_OOFA_DOWN, 
+Fem_Head_SO_UP = GO_rapa_SOFH_UP,
+Fem_Head_SO_DOWN = GO_rapa_SOFH_DOWN, 
+Fem_Thorax_SO_UP = GO_rapa_SOFT_UP, 
+Fem_Thorax_SO_DOWN = GO_rapa_SOFT_DOWN, 
+Fem_Abdomen_SO_UP = GO_rapa_SOFA_UP, 
+Fem_Abdomen_SO_DOWN = GO_rapa_SOFA_DOWN, 
+Male_Head_OO_UP = GO_rapa_OOMH_UP,
+Male_Head_OO_DOWN = GO_rapa_OOMH_DOWN, 
+Male_Thorax_OO_UP = GO_rapa_OOMT_UP, 
+Male_Thorax_OO_DOWN = GO_rapa_OOMT_DOWN, 
+Male_Abdomen_OO_UP = GO_rapa_OOMA_UP, 
+Male_Abdomen_OO_DOWN = GO_rapa_OOMA_DOWN, 
+Male_Head_SO_UP = GO_rapa_SOMH_UP,
+Male_Head_SO_DOWN = GO_rapa_SOMH_DOWN, 
+Male_Thorax_SO_UP = GO_rapa_SOMT_UP, 
+Male_Thorax_SO_DOWN = GO_rapa_SOMT_DOWN, 
+Male_Abdomen_SO_UP = GO_rapa_SOMA_UP, 
+Male_Abdomen_SO_DOWN = GO_rapa_SOMA_DOWN)
+
+for (name in names(dfs)) {
+  addWorksheet(wb, name)
+  writeData(wb, sheet = name, x = dfs[[name]])
+}
+
+saveWorkbook(wb, "TableS9.xlsx", overwrite = TRUE)
+```
+
+## Female GO figure
+
+```{r, rapa GO barplot females by direction, fig.height=24, fig.width=34}
+female_rapa_go_by_mito <- cowplot::plot_grid(fem_hdOO, fem_thOO, fem_abOO, fem_hdSO, fem_thSO, fem_abSO, ncol=3, labels=LETTERS[1:6], label_size = 25)
+
+ggsave("female_rapa_go_by_mito2.pdf", 
+       female_rapa_go_by_mito,
+       width = 22,
+       height = 29)
+```
+
+## Male GO figure
+
+```{r, rapa GO barplot males by direction, fig.height=24, fig.width=34}
+male_rapa_go_by_mito <- cowplot::plot_grid(mal_hdOO, mal_thOO, mal_abOO, mal_hdSO, mal_thSO, mal_abSO, ncol=3,  labels=LETTERS[1:6], label_size = 25)
+ggsave("male_rapa_go_by_mito2.pdf", 
+       male_rapa_go_by_mito,
+       width = 22,
+       height = 29)
+```
+
+```{r session_info}
+devtools::session_info()
+```
+
+This document was processed on: `r Sys.Date()`

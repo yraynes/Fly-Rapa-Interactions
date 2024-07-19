@@ -1,0 +1,617 @@
+---
+title: "Rapa-by-Tissue Interaction Analysis"
+author: "Yevgeniy Raynes"
+output:
+  html_document:
+    toc: true
+params:
+   FDR: 0.05
+   LFC: 0.0
+date: "2023-10-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+FDR.Thresh <- params$FDR
+LFC.Thresh <- params$LFC
+set.seed(1234)
+```
+
+
+# RNAseq analysis of the impact of tissue on the reponse to Rapa
+
+
+## Load packages.
+This document depends on the following packages:
+```{r, message=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(apeglm)
+library(eulerr)
+library(EnhancedVolcano)
+library(flybaseR)
+library(drosophila2.db)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+library(repr)
+library(vsn)
+library(pheatmap)
+library(WGCNA)
+library(clusterProfiler)
+library(DEGreport)
+source("FBidsTOSymbol.R")
+library(RNAseqQC)
+library(ensembldb)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(magrittr)
+library(simplifyEnrichment)
+library(stats)
+library(msigdbr)
+library(GO.db)
+library(ggridges)
+library(enrichplot)
+library(ggupset)
+library(gplots)
+library(UpSetR)
+library(rrvgo)
+library(IHW)
+library(patchwork)
+```
+
+## Read count tables/group info into R.
+Acquiring data 
+```{r, data acquisition}
+cts <- as.matrix(read.csv("C:/Users/yevge/Dropbox/Brown/Work/rapa_tissue/rapa_count_table.csv", row.names = 1)) 
+coldata <- read.csv("C:/Users/yevge/Dropbox/Brown/Work/rapa_tissue/rapa_group_data.csv", row.names = 1)
+
+cts <- subset(cts, select = -OOFCH4)
+coldata <- coldata[colnames(cts),]
+
+coldata$Species <- as.factor(coldata$Species)
+coldata$Treatment <- as.factor(coldata$Treatment)
+coldata$Tissue <- as.factor(coldata$Tissue)
+coldata$Group <- as.factor(coldata$Group)
+coldata$TissueTreatment <- paste0(coldata$Tissue, coldata$Treatment)
+coldata$TissueTreatment <- as.factor(coldata$TissueTreatment)
+coldata$Treatment <- relevel(coldata$Treatment, "Rapa")
+
+```
+
+### Go annotations set up
+
+```{r set up GO annotations}
+
+orgDb=org.Dm.eg.db
+columns(orgDb)
+
+all_flybase_ids <- keys(orgDb, keytype = "FLYBASE")
+
+go_annotations <- select(orgDb, keys = all_flybase_ids, columns = c("FLYBASE", "GO"), keytype = "FLYBASE")
+kegg_annotations <- select(orgDb, keys = all_flybase_ids, columns = c("FLYBASE", "PATH"), keytype = "FLYBASE")
+kegg_annotations <- na.omit(kegg_annotations)
+
+#go_annotations <-   go_annotations[go_annotations$ONTOLOGY == "BP", ]
+go_annotations <- go_annotations %>% 
+  dplyr::filter(ONTOLOGY=="BP")
+
+go_annotations <- go_annotations[, c("GO","FLYBASE")]
+go_annotations <- na.omit(go_annotations)
+
+go_annotations$TERM <- select(GO.db, keys = go_annotations$GO, columns = "TERM", keytype = "GOID")$TERM
+go_annotations <- go_annotations[, c("TERM", "FLYBASE", "GO")]
+
+go_annotations$NAME <- paste(go_annotations$GO, go_annotations$TERM, sep=" ")
+go_annotations <- go_annotations[,c("NAME","FLYBASE")]
+
+```
+
+
+# FEMALES
+
+```{r subset count table to female data}
+cts_f <- cts[,substring(colnames(cts), 3, 3)=="F"] #Subset the data to just columns with F
+coldata_f <- coldata[colnames(cts_f),]
+gene_universe_f <- rownames(cts_f[rowSums(cts_f)>0, ])
+length(gene_universe_f)
+
+ifelse(!dir.exists("results/Females"), dir.create("results/Females", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_f, "results/Females/gene_universe_f.txt")
+
+levels(coldata_f$Tissue)
+
+go_annotations_F <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_f)
+```
+
+
+## Tissue x Treatment Interaction
+
+### DESeqDataSet: Treatment x Species x Tissue
+
+```{r make a new dds object with female data}
+dds_f <- DESeqDataSetFromMatrix(countData = cts_f,
+                              colData = coldata_f,
+                              design = ~ Treatment * Species * Tissue) 
+keep <- rowSums(counts(dds_f)) >= 1 #minimal pre-filtering
+table(keep)
+dds_f <- dds_f[keep,]
+
+dds_f <-  DESeq(dds_f)
+resultsNames(dds_f)
+```
+
+### Interaction between treatment and tissue: Females
+
+```{r treatment x tissue interactions for female data}
+res_Tr_Tiss_AH_F <- results(dds_f, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,  name="TreatmentControl.TissueHead", filterFun=ihw) 
+# the interaction term for treatment effect in Abdomen vs Head 
+# i.e. Abdomen - Head
+summary(res_Tr_Tiss_AH_F)
+res_Tr_Tiss_AH_F_Ordered <- res_Tr_Tiss_AH_F[order(res_Tr_Tiss_AH_F$pvalue),]
+res_Tr_Tiss_AH_F_Sig <- subset(res_Tr_Tiss_AH_F_Ordered, padj < 0.05)
+
+write.csv(res_Tr_Tiss_AH_F_Sig, "results/Females/Tr_Tiss_AH_F.csv")
+
+
+head(convertFBids(row.names(res_Tr_Tiss_AH_F_Sig)))
+
+res_Tr_Tiss_AT_F <- results(dds_f, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,  name="TreatmentControl.TissueThorax", filterFun=ihw) 
+# the interaction term for treatment effect in Thorax vs Abdomen
+# i.e. Abdomen - Thorax
+summary(res_Tr_Tiss_AT_F)
+res_Tr_Tiss_AT_F_Ordered <- res_Tr_Tiss_AT_F[order(res_Tr_Tiss_AT_F$pvalue),]
+res_Tr_Tiss_AT_F_Sig <- subset(res_Tr_Tiss_AT_F_Ordered, padj < 0.05)
+write.csv(res_Tr_Tiss_AT_F_Sig, "results/Females/Tr_Tiss_AT_F.csv")
+
+res_Tr_Tiss_TH_F <- results(dds_f, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh, 
+                            contrast=list("TreatmentControl.TissueHead","TreatmentControl.TissueThorax"), filterFun=ihw) 
+# the interaction term for treatment effect in Head vs Thorax
+# i.e. Thorax - Head 
+summary(res_Tr_Tiss_TH_F)
+res_Tr_Tiss_TH_F_Ordered <- res_Tr_Tiss_TH_F[order(res_Tr_Tiss_TH_F$pvalue),]
+res_Tr_Tiss_TH_F_Sig <- subset(res_Tr_Tiss_TH_F_Ordered, padj < 0.05)
+write.csv(res_Tr_Tiss_TH_F_Sig, "results/Females/Tr_Tiss_TH_F.csv")
+
+```
+
+
+
+```{r, fig.height=6, fig.width=6}
+
+a <- EnhancedVolcano(res_Tr_Tiss_AH_F,
+  lab = convertFBids(rownames(res_Tr_Tiss_AH_F)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Tissue x Treatment: HvA',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+
+b <- EnhancedVolcano(res_Tr_Tiss_AT_F,
+  lab = convertFBids(rownames(res_Tr_Tiss_AT_F)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Tissue x Treatment: TvA',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+
+c <- EnhancedVolcano(res_Tr_Tiss_TH_F,
+  lab = convertFBids(rownames(res_Tr_Tiss_TH_F)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Tissue x Treatment: HvT',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+```
+
+
+```{r, fig.height=10, fig.width=15}
+cowplot::plot_grid(a, b, c, ncol=3)
+```
+
+### GO enrichment
+
+#### Abd vs Head
+
+```{r, abdomen vs head, fig.height=10, fig.width=6}
+ 
+GO_Tr_Tiss_AH_F <- enrichGO(rownames(res_Tr_Tiss_AH_F_Sig), OrgDb=drosophila2.db, universe = gene_universe_f, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Tiss_AH_F_simp <- simplify(GO_Tr_Tiss_AH_F, cutoff = .7) #24 categories
+
+write.csv(GO_Tr_Tiss_AH_F_simp, "results/Females/GO_Tr_Tiss_AH_F.csv")
+```
+
+#### Abd vs Thorax
+
+```{r, abdomen vs thorax, fig.height=10, fig.width=6}
+GO_Tr_Tiss_AT_F <- enrichGO(rownames(res_Tr_Tiss_AT_F_Sig), OrgDb=drosophila2.db, universe = gene_universe_f, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Tiss_AT_F_simp <- simplify(GO_Tr_Tiss_AT_F, cutoff = .7) #32 categories
+
+write.csv(GO_Tr_Tiss_AT_F_simp, "results/Females/GO_Tr_Tiss_AT_F.csv")
+```
+
+#### Thorax vs Head
+
+```{r, thorax v head, fig.height=10, fig.width=6}
+ 
+GO_Tr_Tiss_TH_F <- enrichGO(rownames(res_Tr_Tiss_TH_F_Sig), OrgDb=drosophila2.db, universe = gene_universe_f, keyType = "FLYBASE", ont = "BP")
+## NO ENRICHMENT
+```
+
+# MALES
+
+```{r subset count table to male data}
+cts_m <- cts[,substring(colnames(cts), 3, 3)=="M"] #Subset the data to just columns with M
+coldata_m <- coldata[colnames(cts_m),]
+gene_universe_m <- rownames(cts_m[rowSums(cts_m)>0, ])
+length(gene_universe_m)
+
+ifelse(!dir.exists("results/Males"), dir.create("results/Males", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_m, "results/Males/gene_universe_m.txt")
+
+go_annotations_M <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_m)
+```
+
+## Tissue x Treatment Interaction
+
+### DESeqDataSet: Treatment x Species x Tissue
+
+```{r make a new dds object with male data}
+dds_m <- DESeqDataSetFromMatrix(countData = cts_m,
+                              colData = coldata_m,
+                              design = ~ Treatment * Species * Tissue) 
+keep <- rowSums(counts(dds_m)) >= 1 #minimal pre-filtering
+table(keep)
+dds_m <- dds_m[keep,]
+
+dds_m <-  DESeq(dds_m)
+resultsNames(dds_m)
+```
+
+### Interaction between treatment and tissue: Males
+
+```{r treatment x tissue interactions for male data, fig.height=6, fig.width=6}
+res_Tr_Tiss_AH_M <- results(dds_m, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,  name="TreatmentControl.TissueHead", filterFun=ihw) 
+# the interaction term for treatment effect in Head vs Abdomen
+# i.e. is rapa effect different in head compared to abdomen
+summary(res_Tr_Tiss_AH_M)
+res_Tr_Tiss_AH_M_Ordered <- res_Tr_Tiss_AH_M[order(res_Tr_Tiss_AH_M$pvalue),]
+res_Tr_Tiss_AH_M_Sig <- subset(res_Tr_Tiss_AH_M_Ordered, padj < 0.05)
+write.csv(res_Tr_Tiss_AH_M_Sig, "results/Males/Tr_Tiss_AH_M.csv")
+
+
+res_Tr_Tiss_AT_M <- results(dds_m, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,  name="TreatmentControl.TissueThorax", filterFun=ihw) 
+# the interaction term for treatment effect in Thorax vs Abdomen
+# i.e. is rapa effect different in thorax compared to abdomen
+summary(res_Tr_Tiss_AT_M)
+res_Tr_Tiss_AT_M_Ordered <- res_Tr_Tiss_AT_M[order(res_Tr_Tiss_AT_M$pvalue),]
+res_Tr_Tiss_AT_M_Sig <- subset(res_Tr_Tiss_AT_M_Ordered, padj < 0.05)
+write.csv(res_Tr_Tiss_AT_M_Sig, "results/Males/Tr_Tiss_AT_M.csv")
+
+
+res_Tr_Tiss_TH_M <- results(dds_m, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,  contrast=list("TreatmentControl.TissueHead","TreatmentControl.TissueThorax"), filterFun=ihw) 
+# the interaction term for treatment effect in Head vs Thorax
+# i.e. is rapa effect different in Head compared to Thorax
+summary(res_Tr_Tiss_TH_M)
+res_Tr_Tiss_TH_M_Ordered <- res_Tr_Tiss_TH_M[order(res_Tr_Tiss_TH_M$pvalue),]
+res_Tr_Tiss_TH_M_Sig <- subset(res_Tr_Tiss_TH_M_Ordered, padj < 0.05)
+write.csv(res_Tr_Tiss_TH_M_Sig, "results/Males/Tr_Tiss_TH_M.csv")
+
+```
+
+### GO enrichment
+
+#### Abd vs Head
+
+```{r, abdomen vs head males, fig.height=10, fig.width=6}
+GO_Tr_Tiss_AH_M <- enrichGO(rownames(res_Tr_Tiss_AH_M_Sig), OrgDb=drosophila2.db, universe = gene_universe_m, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Tiss_AH_M_simp <- simplify(GO_Tr_Tiss_AH_M, cutoff = .7) #25 categories
+write.csv(GO_Tr_Tiss_AH_M_simp, "results/Males/GO_Tr_Tiss_AH_M.csv")
+```
+
+#### Abd vs Thorax
+
+```{r, abdomen vs thorax males, fig.height=5, fig.width=7}
+GO_Tr_Tiss_AT_M <- enrichGO(rownames(res_Tr_Tiss_AT_M_Sig), OrgDb=drosophila2.db, universe = gene_universe_m, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Tiss_AT_M_simp <- simplify(GO_Tr_Tiss_AT_M, cutoff = .7) #6 categories
+write.csv(GO_Tr_Tiss_AT_M_simp, "results/Males/GO_Tr_Tiss_AT_M.csv")
+```
+
+
+#### Thorax vs Head
+
+```{r, thorax v head males, fig.height=3, fig.width=4}
+GO_Tr_Tiss_TH_M <- enrichGO(rownames(res_Tr_Tiss_TH_M_Sig), OrgDb=drosophila2.db, universe = gene_universe_m, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Tiss_TH_M_simp <- simplify(GO_Tr_Tiss_TH_M, cutoff = .7) #4 categories
+write.csv(GO_Tr_Tiss_TH_M_simp, "results/Males/GO_Tr_Tiss_TH_M.csv")
+```
+
+
+# RESULTS
+
+## Tissue x Treatment Interaction
+
+### Counts
+
+### Intersections
+
+```{r, fig.width=8}
+tissue_treatment_interaction <- list(Head.Abdomen.Females=rownames(res_Tr_Tiss_AH_F_Sig), 
+                   Thorax.Abdomen.Females=rownames(res_Tr_Tiss_AT_F_Sig), 
+                   Head.Thorax.Females=rownames(res_Tr_Tiss_TH_F_Sig),
+                   Head.Abdomen.Males=rownames(res_Tr_Tiss_AH_M_Sig), 
+                   Thorax.Abdomen.Males=rownames(res_Tr_Tiss_AT_M_Sig), 
+                   Head.Thorax.Males=rownames(res_Tr_Tiss_TH_M_Sig)
+                   )
+
+names(tissue_treatment_interaction)
+
+
+tissue_treatment_interaction_GO <- list(Head.Abdomen.Females=as.data.frame(GO_Tr_Tiss_AH_F_simp)$ID, 
+                   Thorax.Abdomen.Females=as.data.frame(GO_Tr_Tiss_AT_F_simp)$ID, 
+                   Head.Thorax.Females=as.data.frame(GO_Tr_Tiss_TH_F)$ID,
+                   Head.Abdomen.Males=as.data.frame(GO_Tr_Tiss_AH_M_simp)$ID, 
+                   Thorax.Abdomen.Males=as.data.frame(GO_Tr_Tiss_AT_M_simp)$ID, 
+                   Head.Thorax.Males=as.data.frame(GO_Tr_Tiss_TH_M_simp)$ID
+                   )
+
+names(tissue_treatment_interaction_GO)
+```
+
+#### Upset plot
+
+```{r, DEGs, fig.width=8}
+pdf(file="degs_intersection_upset_TR_TISS.pdf",
+    width = 8.1,
+    height = 4,
+    onefile=FALSE)
+upset(
+                                fromList(tissue_treatment_interaction),
+                                nsets=6, 
+                                sets=c("Head.Abdomen.Females",
+                                       "Thorax.Abdomen.Females",
+                                       "Head.Thorax.Females",
+                                       "Head.Abdomen.Males",
+                                       "Thorax.Abdomen.Males",
+                                       "Head.Thorax.Males"),
+                                order.by = c("degree"),
+                                decreasing=F,
+                                sets.x.label = "Total DE Gene #",
+                                main.bar.color = "#984ea3", 
+                                sets.bar.color = "#ff7f00",
+                                matrix.color = "#984ea3",
+                                att.color = "black",
+                                text.scale = 1.4,
+                                set_size.scale_max = 1040,
+                                point.size = 2.8,
+                                set_size.show=TRUE, keep.order=TRUE,
+                                intersections = list(
+                                  list("Head.Abdomen.Females"),
+                                  list("Thorax.Abdomen.Females"),
+                                  list("Head.Thorax.Females"),
+                                    
+                                  list("Head.Abdomen.Females", "Thorax.Abdomen.Females"),
+                                  list("Head.Abdomen.Females", "Head.Thorax.Females"),
+                                  list("Thorax.Abdomen.Females", "Head.Thorax.Females"),
+                                  list("Head.Abdomen.Males"),
+                                  list("Thorax.Abdomen.Males"),
+                                  list("Head.Thorax.Males"),
+                                    
+                                  list("Head.Abdomen.Males", "Thorax.Abdomen.Males"),
+                                  list("Head.Abdomen.Males", "Head.Thorax.Males"),
+                                  list("Thorax.Abdomen.Males", "Head.Thorax.Males"),
+                                  list("Head.Abdomen.Males","Head.Abdomen.Females"),
+                                  list("Thorax.Abdomen.Males","Thorax.Abdomen.Females"),
+                                  list("Head.Thorax.Males", "Head.Thorax.Females"),
+                                  list("Head.Abdomen.Females", "Thorax.Abdomen.Females", "Head.Thorax.Females"),
+                                  list("Head.Abdomen.Males", "Thorax.Abdomen.Males", "Head.Thorax.Males")
+                                )
+)
+
+dev.off()
+```
+
+
+```{r, GO cats, fig.width=8}
+pdf(file="GO_cats_intersection_upset_TR_TISS.pdf",
+    width = 8.1,
+    height = 4,
+    onefile=FALSE)
+upset(
+                                fromList(tissue_treatment_interaction_GO),
+                                nsets=6, 
+                                sets=c("Head.Abdomen.Females",
+                                       "Thorax.Abdomen.Females",
+                                       "Head.Thorax.Females",
+                                       "Head.Abdomen.Males",
+                                       "Thorax.Abdomen.Males",
+                                       "Head.Thorax.Males"),
+                                order.by = c("degree"),
+                                decreasing=F,
+                                sets.x.label = "Total DE Gene #",
+                                main.bar.color = "#984ea3", 
+                                sets.bar.color = "#ff7f00",
+                                matrix.color = "#984ea3",
+                                att.color = "black",
+                                text.scale = 1.4,
+                                set_size.scale_max = 55,
+                                point.size = 2.8,
+                                set_size.show=TRUE, keep.order=TRUE,
+                                intersections = list(
+                                  list("Head.Abdomen.Females"),
+                                  list("Thorax.Abdomen.Females"),
+                                  list("Head.Thorax.Females"),
+                                    
+                                  list("Head.Abdomen.Females", "Thorax.Abdomen.Females"),
+                                  list("Head.Abdomen.Females", "Head.Thorax.Females"),
+                                  list("Thorax.Abdomen.Females", "Head.Thorax.Females"),
+                                  list("Head.Abdomen.Males"),
+                                  list("Thorax.Abdomen.Males"),
+                                  list("Head.Thorax.Males"),
+                                    
+                                  list("Head.Abdomen.Males", "Thorax.Abdomen.Males"),
+                                  list("Head.Abdomen.Males", "Head.Thorax.Males"),
+                                  list("Thorax.Abdomen.Males", "Head.Thorax.Males"),
+                                  list("Head.Abdomen.Males","Head.Abdomen.Females"),
+                                  list("Thorax.Abdomen.Males","Thorax.Abdomen.Females"),
+                                  list("Head.Thorax.Males", "Head.Thorax.Females"),
+                                  list("Head.Abdomen.Females", "Thorax.Abdomen.Females", "Head.Thorax.Females"),
+                                  list("Head.Abdomen.Males", "Thorax.Abdomen.Males", "Head.Thorax.Males")
+                                )
+)
+
+dev.off()
+```
+
+### GO Enrichment 
+
+```{r, fig.height=30, fig.width=18}
+colors <- c(low = '#e41a1c', mid ="#984ea3", high = '#377eb8')
+
+AH_F_GO_plot <- as.data.frame(GO_Tr_Tiss_AH_F_simp) %>% #25 cats
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 15) %>%
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"],  high = colors["high"]) +
+  ylab('DEG Count') +
+  coord_flip() +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "left",
+    legend.key.size = unit(1, "cm"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 28),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 32),  # Increase font size for y-axis
+    axis.title.x = element_text(size = 32),  # Increase font size for y-axis title
+    # plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 26),  # Increase font size for legend text
+    legend.title = element_text(size = 30)
+  ) 
+
+
+AH_M_GO_plot <- as.data.frame(GO_Tr_Tiss_AH_M_simp) %>% #48 cats
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 15) %>%
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"],  high = colors["high"]) +
+  ylab('DEG Count') +
+  coord_flip() +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "right",
+    legend.key.size = unit(1, "cm"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 28),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 32),  # Increase font size for y-axis
+    axis.title.x = element_text(size = 32),  # Increase font size for y-axis title
+    # plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 26),  # Increase font size for legend text
+    legend.title = element_text(size = 30)
+  ) 
+
+
+AT_F_GO_plot <- as.data.frame(GO_Tr_Tiss_AT_F_simp) %>% #25 cats
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 15) %>% 
+  dplyr::filter(Description != "purine nucleoside monophosphate metabolic process")%>% 
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"],  high = colors["high"]) +
+  ylab('DEG Count') +
+  coord_flip() +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "left",
+    legend.key.size = unit(1, "cm"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 28),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 32),  # Increase font size for y-axis
+    axis.title.x = element_text(size = 32),  # Increase font size for y-axis title
+    # plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 26),  # Increase font size for legend text
+    legend.title = element_text(size = 30)
+  ) 
+
+
+AT_M_GO_plot <- as.data.frame(GO_Tr_Tiss_AT_M_simp) %>% #6 cats
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 6) %>%
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"],  high = colors["high"]) +
+  ylab('DEG Count') +
+  coord_flip() +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "right",
+    legend.key.size = unit(1, "cm"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 28),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 32),  # Increase font size for y-axis
+    axis.title.x = element_text(size = 32),  # Increase font size for y-axis title
+    # plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 26),  # Increase font size for legend text
+    legend.title = element_text(size = 30)
+  ) 
+
+
+TH_M_GO_plot <- as.data.frame(GO_Tr_Tiss_TH_M_simp) %>% #4 cats
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 4) %>%
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"],  high = colors["high"]) +
+  ylab('DEG Count') +
+  coord_flip() +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "right",
+    legend.key.size = unit(1, "cm"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 28),  # Increase font size for x-axis
+    axis.text.y = element_text(size = 32),  # Increase font size for y-axis
+    axis.title.x = element_text(size = 32),  # Increase font size for y-axis title
+    # plot.title = element_text(size = 22),  # Increase font size for plot title
+    legend.text = element_text(size = 26),  # Increase font size for legend text
+    legend.title = element_text(size = 30)
+  ) 
+
+```
+
+
+```{r, fig.height=30, fig.width=18}
+AT_TH <- wrap_elements(grid::textGrob('Test')) + AT_M_GO_plot + grid::textGrob('Test') + TH_M_GO_plot + grid::textGrob('Test') + plot_layout(ncol = 1, heights = c(2, 6, 2, 4, 1))
+
+go_enrichment_plot <- AH_F_GO_plot + AT_F_GO_plot + AH_M_GO_plot + AT_TH + plot_layout(ncol = 2, byrow = FALSE)
+
+ggsave("TissueTreatment_GO_Enrich.pdf", plot = go_enrichment_plot, width = 30, height = 34, dpi = 300)
+```
+
+
+```{r session_info}
+devtools::session_info()
+```
+
+This document was processed on: `r Sys.Date()`

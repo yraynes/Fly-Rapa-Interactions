@@ -1,0 +1,1310 @@
+---
+title: "Rapa-by-Sex Interaction Analysis"
+author: "Yevgeniy Raynes"
+output:
+  html_document:
+    toc: true
+params:
+   FDR: 0.05
+   LFC: 0.0
+date: "2023-10-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+FDR.Thresh <- params$FDR
+LFC.Thresh <- params$LFC
+set.seed(1234)
+```
+
+#RNAseq analysis of the impact of sex on the reponse to Rapa: Sex x Rapa interaction
+
+## Load packages.
+
+This document depends on the following packages:
+
+```{r, message=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(apeglm)
+library(eulerr)
+library(EnhancedVolcano)
+library(flybaseR)
+library(drosophila2.db)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+library(repr)
+library(vsn)
+library(pheatmap)
+library(WGCNA)
+library(clusterProfiler)
+library(DEGreport)
+source("FBidsTOSymbol.R")
+library(RNAseqQC)
+library(ensembldb)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(magrittr)
+library(simplifyEnrichment)
+library(stats)
+library(msigdbr)
+library(GO.db)
+library(ggridges)
+library(enrichplot)
+library(ggupset)
+library(gplots)
+library(UpSetR)
+library(rrvgo)
+library(IHW)
+library(patchwork)
+```
+
+## Read count tables/group info into R
+
+```{r data acquisition}
+
+cts <- as.matrix(read.csv("rapa_count_table.csv", row.names = 1))
+cts <- subset(cts, select = -OOFCH4)
+
+gene_universe_all <- row.names(cts[rowSums(cts)>0, ])
+length(gene_universe_all)
+
+ifelse(!dir.exists("results/All_Data"), dir.create("results/All_Data", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_all, "results/All_Data/gene_universe_ad.txt")
+
+coldata <- read.csv("rapa_group_data.csv", row.names = 1)
+coldata <- coldata[colnames(cts),]
+
+coldata$SexTreatment <- paste0(coldata$Sex, coldata$Treatment)
+coldata$SexTreatmentMito <- paste0(coldata$Sex, coldata$Treatment, coldata$Species)
+
+#save experimental features as factors
+coldata$Treatment <- as.factor(coldata$Treatment)
+coldata$Tissue <- as.factor(coldata$Tissue)
+coldata$Species <- as.factor(coldata$Species)
+coldata$Group <- as.factor(coldata$Group)
+coldata$Sex <- as.factor(coldata$Sex)
+coldata$SexTreatment <-as.factor(coldata$SexTreatment)
+coldata$SexTreatmentMito <-as.factor(coldata$SexTreatmentMito)
+
+levels(coldata$Treatment)
+coldata$Treatment <- relevel(coldata$Treatment, "Rapa")
+levels(coldata$Treatment)
+```
+
+### Go annotations set up
+
+```{r acquire D.mel gene set from MSigDB using msigdbr}
+
+orgDb=org.Dm.eg.db
+columns(orgDb)
+
+all_flybase_ids <- keys(orgDb, keytype = "FLYBASE")
+
+go_annotations <- select(orgDb, keys = all_flybase_ids, columns = c("FLYBASE", "GO"), keytype = "FLYBASE")
+kegg_annotations <- select(orgDb, keys = all_flybase_ids, columns = c("FLYBASE", "PATH"), keytype = "FLYBASE")
+kegg_annotations <- na.omit(kegg_annotations)
+
+go_annotations <- go_annotations %>% 
+  dplyr::filter(ONTOLOGY=="BP")
+
+go_annotations <- go_annotations[, c("GO","FLYBASE")]
+go_annotations <- na.omit(go_annotations)
+
+go_annotations$TERM <- select(GO.db, keys = go_annotations$GO, columns = "TERM", keytype = "GOID")$TERM
+go_annotations <- go_annotations[, c("TERM", "FLYBASE", "GO")]
+
+go_annotations$NAME <- paste(go_annotations$GO, go_annotations$TERM, sep=" ")
+go_annotations <- go_annotations[,c("NAME","FLYBASE")]
+
+```
+
+### Split data by tissue
+
+```{r thorax data}
+cts_T <- cts[,substring(colnames(cts),5,5)=="T"] #subset data to thorax columns
+coldata_T <- coldata[colnames(cts_T),]
+
+gene_universe_T <- row.names(cts[rowSums(cts_T)>0, ])
+length(gene_universe_T)
+
+ifelse(!dir.exists("results/Thorax"), dir.create("results/Thorax", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_T, "results/Thorax/gene_universe_T.txt")
+
+go_annotations_Th <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_T)
+
+```
+
+```{r abdomen data}
+cts_A <- cts[,substring(colnames(cts),5,5)=="A"] #subset data to abdomen columns
+coldata_A <- coldata[colnames(cts_A),]
+
+gene_universe_A <- row.names(cts[rowSums(cts_A)>0, ])
+length(gene_universe_A)
+
+ifelse(!dir.exists("results/Abdomen"), dir.create("results/Abdomen", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_A, "results/Abdomen/gene_universe_A.txt")
+
+go_annotations_Ab <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_A)
+```
+
+```{r head data}
+cts_H <- cts[,substring(colnames(cts),5,5)=="H"] #subset data to head columns
+coldata_H <- coldata[colnames(cts_H),]
+
+gene_universe_H <- row.names(cts[rowSums(cts_H)>0, ])
+length(gene_universe_H)
+
+ifelse(!dir.exists("results/Head"), dir.create("results/Head", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_H, "results/Head/gene_universe_H.txt")
+
+go_annotations_Hd <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_H)
+```
+
+### All tissues MDS
+
+```{r}
+
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ Sex * Treatment * Tissue * Species)
+vst <- vst(dds, blind = TRUE)
+sampleDists <- dist(t(assay(vst))) 
+
+#dist computes the euclidean distance matrix.
+
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, k=3, eig = TRUE)
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities
+
+mds <- cbind(as.data.frame(colData(vst)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+Dim3 <- mds_dist$eig[3]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim3 <- signif(Dim3, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+mds$labels <- paste(mds$Sex, mds$Treatment, sep = " ")
+mds$TissueSpecies <- paste(mds$Tissue, mds$Species, sep = " ")
+mds$TissueTreatment <- factor(paste(mds$Tissue, mds$Treatment, sep = " "))
+```
+
+#### MDS plot for publication
+
+```{r}
+mdsplot <- ggplot(mds, aes(x = `1`, y = `2`, color = Sex, shape = Tissue, fill = Treatment)) +
+  geom_point(size = 4,  stroke = 1.5)+
+  coord_fixed() +
+  labs(
+    x = paste0("Dimension 1 (", Dim1, "%)"),
+    y = paste0("Dimension 2 (", Dim2, "%)"),
+    color = "Sex",
+    shape = "Tissue",
+    fill = "Treatment"
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Abdomen" = 21,
+      "Head" = 22,
+      "Thorax" = 23
+    ),
+    limits = c( "Head", "Thorax", "Abdomen") 
+  ) +
+
+  scale_color_manual(values = c("Female" = "salmon", "Male" = "cyan4")) +
+  scale_fill_manual(values = c("Rapa" = "darkgrey", "Control" = "white"), 
+                    breaks = c("Rapa", "Control"),  # Specify breaks for the legend
+                    labels = c("Rapa", "Control")) + 
+  theme_minimal() +  
+  theme(
+    legend.position = "right",  
+    legend.title = element_text(size = 12),  
+    legend.text = element_text(size = 10),  
+    
+    plot.title = element_text(size = 14, face = "bold"),  
+
+    
+    axis.text.x = element_text(size = 10),  
+    axis.text.y = element_text(size = 10),  
+    axis.title = element_text(size = 14),  
+   
+    
+  )+
+  guides(
+    shape = guide_legend(order = 1),  # Set the order of Tissue in legend
+    color = guide_legend(order = 2),
+    fill = guide_legend(
+    override.aes = list(
+      shape = c(21, 21),  # Use shape 21 (filled circle) 
+      color = c("#999999", "#999999"),  # Set the colors for Rapa and Control
+      fill = c("#999999", "white")  # Set the fill colors for Rapa and Control
+    ),
+    title = "Treatment", # Specify the legend title
+    order = 3))  
+
+mdsplot
+ggsave("mdsplot2.pdf", plot = mdsplot, width = 7, height = 8, dpi = 300)
+```
+
+## THORAX
+
+### Treatment effect in female thorax
+
+```{r treatment effect in female thorax}
+res_Tr_Fem_T <- readRDS("results/Female_Thorax/res_Tr_Fem_T.rds")
+res_Tr_Fem_T_Ordered <- res_Tr_Fem_T[order(res_Tr_Fem_T$pvalue),]
+res_Tr_Fem_T_Sig <- subset(res_Tr_Fem_T_Ordered, padj < 0.05)
+```
+
+### Treatment effect in male thorax
+
+```{r treatment effect in male thorax}
+res_Tr_Mal_T <- readRDS("results/Male_Thorax/res_Tr_Mal_T.rds")
+res_Tr_Mal_T_Ordered <- res_Tr_Mal_T[order(res_Tr_Mal_T$pvalue),]
+res_Tr_Mal_T_Sig <- subset(res_Tr_Mal_T_Ordered, padj < 0.05)
+```
+
+
+### Interaction DESeqDataSet
+
+```{r Thorax DESeqDataSet}
+dds_T <- DESeqDataSetFromMatrix(countData = cts_T,
+                              colData = coldata_T,
+                              design = ~ Sex * Treatment * Species)
+keep <- rowSums(counts(dds_T)) >= 10 #minimal pre-filtering
+table(keep)
+dds_T <- dds_T[keep,]
+```
+
+### Thorax MDS
+
+```{r, fig.width=8, fig.height=6}
+vst_T <- vst(dds_T, blind = TRUE)
+sampleDists <- dist(t(assay(vst_T))) 
+
+#dist computes the euclidean distance matrix.
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities
+
+mds <- cbind(as.data.frame(colData(vst_T)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+```
+
+```{r}
+thorax_mds_plt_2 <- ggplot(mds, aes(x = `1`, y = `2`, color = Sex, shape = Treatment, fill = Species)) +
+  geom_point(size = 4,  stroke = 1.5)+
+  coord_fixed() +
+  labs(
+    x = paste0("Dimension 1 (", Dim1, "%)"),
+    y = paste0("Dimension 2 (", Dim2, "%)"),
+    color = "Sex",
+    shape = "Treatment",
+    fill = "mtDNA"
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Control" = 21,
+      "Rapa" = 22
+    ),
+    limits = c( "Control", "Rapa"),
+    labels = c("Control", "Rapamycin")
+  ) +
+
+  scale_color_manual(values = c("Female" = "salmon", "Male" = "cyan4")) +
+  scale_fill_manual(values = c("SO" = "darkgrey", "OO" = "white"), 
+                    breaks = c("SO", "OO"),  # Specify breaks for the legend
+                    labels = c("foreign (sm21)", "native (OreR)")) + 
+  theme_minimal() +  
+  theme(
+    legend.position = "none",  
+    legend.title = element_text(size = 12), 
+    legend.text = element_text(size = 10), 
+    
+    plot.title = element_text(size = 14, face = "bold"),  
+
+    
+    axis.text.x = element_text(size = 10),  
+    axis.text.y = element_text(size = 10),  
+    axis.title = element_text(size = 14),  
+   
+    
+  )+
+  guides(
+    shape = guide_legend(order = 2),  # Set the order of mtDNA in legend
+    color = guide_legend(order = 1),
+    fill = guide_legend(
+    override.aes = list(
+      shape = c(21, 21),  # Use shape 21 (filled circle) 
+      color = c("#999999", "#999999"),  # Set the colors for sm21 and oreR
+      fill = c("#999999", "white")  # Set the fill colors for sm21 and oreR
+    ),
+    title = "mtDNA", # Specify the legend title
+    order = 3))  
+
+thorax_mds_plt_2
+```
+
+### Treament Sex interaction
+
+```{r Thorax dds}
+dds_T <-  DESeq(dds_T)
+resultsNames(dds_T)
+```
+
+### Tr x Sex: DEGs
+
+```{r treatment x sex interaction in Thorax}
+
+res_Tr_Sex_T <- results(dds_T, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh, name="SexMale.TreatmentControl", filterFun=ihw) 
+# the interaction term, answering: is the treatment effect *different* across sexes?
+summary(res_Tr_Sex_T)
+hist(res_Tr_Sex_T$pvalue, breaks=0:50/50, xlab="p value", main="Histogram of nominal p values: res_Tr_Sex_T")
+
+#  apply fold change shrinkage to thorax results
+res_Tr_Sex_T_shrunk <- lfcShrink(dds_T, coef="SexMale.TreatmentControl", type="apeglm") 
+summary(res_Tr_Sex_T_shrunk)
+plotMA(res_Tr_Sex_T, ylim=c(-2,2))
+plotMA(res_Tr_Sex_T_shrunk, ylim=c(-2,2))
+
+
+###
+
+res_Tr_Sex_T_Ordered <- res_Tr_Sex_T[order(res_Tr_Sex_T$pvalue),]
+res_Tr_Sex_T_Sig <- subset(res_Tr_Sex_T_Ordered, padj < 0.05)
+
+thorax_genes <- as.data.frame(res_Tr_Sex_T_Sig)
+thorax_genes$name <- convertFBids(row.names(thorax_genes))
+thorax_genes <- thorax_genes[!is.na(thorax_genes$name),]
+
+write.csv(res_Tr_Sex_T_Sig, "results/Thorax/SexTreatment.csv")
+```
+
+### Tr x Sex: Volcano
+
+```{r, fig.height=6, fig.width=8}
+thorax_volcano1 <- EnhancedVolcano(res_Tr_Sex_T,
+  lab = convertFBids(row.names(res_Tr_Sex_T)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Sex x Treatment in Thorax',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+thorax_volcano2 <- EnhancedVolcano(res_Tr_Sex_T_shrunk,
+  lab = convertFBids(row.names(res_Tr_Sex_T_shrunk)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Sex x Treatment in Thorax',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+cowplot::plot_grid(thorax_volcano1, thorax_volcano2, ncol=2)
+```
+
+### Tr x Sex: GO enrichment
+
+```{r}
+GO_Tr_Sex_T <- enrichGO(row.names(res_Tr_Sex_T_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_T, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Sex_T_simp <- simplify(GO_Tr_Sex_T, cutoff = .7)
+
+
+saveRDS(GO_Tr_Sex_T_simp, file = "results/Thorax/GO_Thorax_simp_df")
+write.csv(GO_Tr_Sex_T_simp, "results/Thorax/GO_Thorax.csv")
+```
+
+### Tr x Sex: KEGG enrichment
+
+```{r, fig.height=4, fig.width=6}
+ids_Tr_Sex_T_Sig <- bitr(row.names(res_Tr_Sex_T_Sig), fromType = "FLYBASE", toType = "ENTREZID", OrgDb=org.Dm.eg.db) 
+universe_T_entrez <- bitr(gene_universe_T, fromType = "FLYBASE", toType = "ENTREZID", OrgDb=org.Dm.eg.db) 
+
+KEGG_Tr_Sex_T <- enrichKEGG(gene=ids_Tr_Sex_T_Sig$ENTREZID, organism="dme", 
+                 pvalueCutoff = 0.05, pAdjustMethod = "BH",
+                 keyType = "ncbi-geneid", universe = universe_T_entrez$ENTREZID)
+
+write.csv(KEGG_Tr_Sex_T, "results/Thorax/KEGG_Thorax.csv")
+```
+### Tr x Sex: GSEA
+
+```{r thorax GSEA}
+res_T <- as.data.frame(res_Tr_Sex_T_shrunk)
+res_T <- res_T %>% dplyr::filter(!is.na(padj))
+
+genes_T_ranked <- sign(res_T$log2FoldChange)*(-log10(res_T$pvalue)) 
+names(genes_T_ranked) <- row.names(res_T)
+
+genes_T_ranked <- sort(genes_T_ranked, decreasing = TRUE) # sort genes by ranking
+gse_T <- GSEA(genes_T_ranked, TERM2GENE = go_annotations_Th, eps=1e-300)
+write.csv(gse_T, "results/Thorax/gse_T.csv")
+
+```
+
+### Interaction type
+Create a new dataframe with rapamycin effects in males and females
+```{r}
+res_Tr_Sex_T_Sig_df <- res_Tr_Sex_T_Sig %>% as.data.frame() 
+
+
+merged_dfT_test <- merge(res_Tr_Sex_T_Sig_df, 
+                    as.data.frame(res_Tr_Mal_T) %>% 
+                      dplyr::select("log2FoldChange.male" = log2FoldChange, padj_mal = padj), 
+                    by = 0, 
+                    all.x = TRUE) 
+row.names(merged_dfT_test) <- merged_dfT_test$Row.names
+merged_dfT_test <- subset(merged_dfT_test, select = -Row.names)
+
+merged_dfT_test <- merge(merged_dfT_test, 
+                    as.data.frame(res_Tr_Fem_T) %>% 
+                      dplyr::select("log2FoldChange.female" = log2FoldChange, padj_fem = padj), 
+                    by = 0, 
+                    all.x = TRUE) 
+
+row.names(merged_dfT_test) <- merged_dfT_test$Row.names
+merged_dfT_test <- subset(merged_dfT_test, select = -Row.names)
+```
+
+
+## ABDOMEN
+
+### Treatment effect in female abdomen
+
+```{r treatment effect in female abdomen}
+res_Tr_Fem_A <- readRDS("results/Female_Abdomen/res_Tr_Fem_A")
+res_Tr_Fem_A_Ordered <- res_Tr_Fem_A[order(res_Tr_Fem_A$pvalue),]
+res_Tr_Fem_A_Sig <- subset(res_Tr_Fem_A_Ordered, padj < 0.05)
+```
+
+### Treatment effect in male abdomen
+
+```{r treatment effect in male abdomen}
+res_Tr_Mal_A <- readRDS("results/Male_Abdomen/res_Tr_Mal_A")
+res_Tr_Mal_A_Ordered <- res_Tr_Mal_A[order(res_Tr_Mal_A$pvalue),]
+res_Tr_Mal_A_Sig <- subset(res_Tr_Mal_A_Ordered, padj < 0.05)
+```
+
+### Interaction DESeqDataSet
+
+```{r Abdomen dds}
+dds_A <- DESeqDataSetFromMatrix(countData = cts_A,
+                              colData = coldata_A,
+                              design = ~ Sex * Treatment * Species) 
+keep <- rowSums(counts(dds_A)) >= 1 #minimal pre-filtering
+table(keep)
+dds_A <- dds_A[keep,]
+```
+
+### Abdomen MDS
+
+```{r, fig.width=8, fig.height=6}
+vst_A <- vst(dds_A, blind = TRUE)
+sampleDists <- dist(t(assay(vst_A))) 
+
+#dist computes the euclidean distance matrix.
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, k=3, eig = TRUE)
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities
+
+#mds1 <- cbind(as.data.frame(colData(vst_A)), cmdscale(sampleDistMatrix))
+mds <- cbind(as.data.frame(colData(vst_A)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+Dim3 <- mds_dist$eig[3]/sum(mds_dist$eig) * 100 # percentage variation explained by the third dimension (third eigenvalue)
+Dim3 <- signif(Dim3, digits = 4)
+mds$name = paste0(mds$Group, mds$Replicate)
+```
+
+```{r}
+abdomen_mds_plt_2 <- ggplot(mds, aes(x = `1`, y = `2`, color = Sex, shape = Treatment, fill = Species)) +
+  geom_point(size = 4,  stroke = 1.5)+
+  coord_fixed() +
+  labs(
+    x = paste0("Dimension 1 (", Dim1, "%)"),
+    y = paste0("Dimension 2 (", Dim2, "%)"),
+    color = "Sex",
+    shape = "Treatment",
+    fill = "mtDNA"
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Control" = 21,
+      "Rapa" = 22
+    ),
+    limits = c( "Control", "Rapa"),
+    labels = c("Control", "Rapamycin")
+  ) +
+
+  scale_color_manual(values = c("Female" = "salmon", "Male" = "cyan4")) +
+  scale_fill_manual(values = c("SO" = "darkgrey", "OO" = "white"), 
+                    breaks = c("SO", "OO"),  # Specify breaks for the legend
+                    labels = c("foreign (sm21)", "native (OreR)")) + 
+  theme_minimal() +  
+  theme(
+    legend.position = "none",  
+    legend.title = element_text(size = 12), 
+    legend.text = element_text(size = 10), 
+    
+    plot.title = element_text(size = 14, face = "bold"),  
+
+    
+    axis.text.x = element_text(size = 10),  
+    axis.text.y = element_text(size = 10),  
+    axis.title = element_text(size = 14),  
+   
+    
+  )+
+  guides(
+    shape = guide_legend(order = 2),  # Set the order of mtDNA in legend
+    color = guide_legend(order = 1),
+    fill = guide_legend(
+    override.aes = list(
+      shape = c(21, 21),  # Use shape 21 (filled circle) 
+      color = c("#999999", "#999999"),  # Set the colors for sm21 and oreR
+      fill = c("#999999", "white")  # Set the fill colors for sm21 and oreR
+    ),
+    title = "mtDNA", # Specify the legend title
+    order = 3))  
+
+abdomen_mds_plt_2
+```
+
+### Treatment Sex Interaction
+
+```{r}
+dds_A <-  DESeq(dds_A)
+resultsNames(dds_A)
+```
+
+
+### Tr X Sex: DEGs
+
+```{r treatment x sex interaction in Abdomen}
+res_Tr_Sex_A <- results(dds_A, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh, name="SexMale.TreatmentControl", filterFun=ihw) 
+# the interaction term, answering: is the treatment effect *different* between sexes?
+# coeff name = SexMale.TreatmentControl 
+
+summary(res_Tr_Sex_A)
+
+res_Tr_Sex_A_Ordered <- res_Tr_Sex_A[order(res_Tr_Sex_A$pvalue),]
+res_Tr_Sex_A_Sig <- subset(res_Tr_Sex_A_Ordered, padj < 0.05)
+res_Tr_Sex_A_Sig_df <- as.data.frame(res_Tr_Sex_A_Sig)
+res_Tr_Sex_A_Sig_df$name <- row.names(res_Tr_Sex_A_Sig_df)
+
+res_Tr_Sex_A_Sig_df <- res_Tr_Sex_A_Sig_df %>%
+  mutate(name = convertFBids(name))
+write.csv(res_Tr_Sex_A_Sig_df, "results/Abdomen/res_Tr_Sex_A_Sig_df.csv")
+write.csv(res_Tr_Sex_A_Sig, "results/Abdomen/SexTreatment.csv")
+
+res_Tr_Sex_A_shrunk <- lfcShrink(dds_A, res=res_Tr_Sex_A, coef="SexMale.TreatmentControl", type="apeglm") 
+summary(res_Tr_Sex_A_shrunk)
+
+res_Tr_Sex_A_shrunk_Ordered <- res_Tr_Sex_A_shrunk[order(res_Tr_Sex_A_shrunk$pvalue),]
+res_Tr_Sex_A_shrunk_Sig <- subset(res_Tr_Sex_A_shrunk_Ordered, padj < 0.05)
+
+plotMA(res_Tr_Sex_A, ylim=c(-2,2))
+plotMA(res_Tr_Sex_A_shrunk, ylim=c(-2,2))
+
+view(res_Tr_Sex_A_Sig_df)
+dim(res_Tr_Sex_A_Sig_df)
+```
+
+### Tr x Sex: Volcano
+
+```{r, fig.height=6, fig.width=8}
+abdomen_volcano1 <- EnhancedVolcano(res_Tr_Sex_A,
+  lab = convertFBids(row.names(res_Tr_Sex_A)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Sex x Treatment in Abdomen',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+
+abdomen_volcano2 <- EnhancedVolcano(res_Tr_Sex_A_shrunk,
+  lab = convertFBids(row.names(res_Tr_Sex_A_shrunk)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Sex x Treatment in Abdomen',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+cowplot::plot_grid(abdomen_volcano1, abdomen_volcano2, ncol=2)
+
+```
+
+### Tr x Sex: GO enrichment
+
+```{r}
+GO_Tr_Sex_A <- enrichGO(row.names(res_Tr_Sex_A_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_A, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Sex_A_simp <- simplify(GO_Tr_Sex_A, cutoff = .7)
+
+saveRDS(GO_Tr_Sex_A_simp, file = "results/Abdomen/GO_Abdomen_simp_df")
+write.csv(GO_Tr_Sex_A_simp, "results/Abdomen/GO_Abdomen.csv")
+```
+
+### Tr x Sex: KEGG enrichment
+
+```{r, fig.height=4, fig.width=6}
+ids_Tr_Sex_A_Sig <- bitr(row.names(res_Tr_Sex_A_Sig), fromType = "FLYBASE", toType = "ENTREZID", OrgDb=org.Dm.eg.db) 
+universe_A_entrez <- bitr(gene_universe_A, fromType = "FLYBASE", toType = "ENTREZID", OrgDb=org.Dm.eg.db) 
+
+KEGG_Tr_Sex_A <- enrichKEGG(gene=ids_Tr_Sex_A_Sig$ENTREZID, organism="dme", 
+                 pvalueCutoff = 0.05, pAdjustMethod = "BH",
+                 keyType = "ncbi-geneid", universe = universe_A_entrez$ENTREZID)
+
+saveRDS(KEGG_Tr_Sex_A, file = "results/Abdomen/KEGG_Abdomen")
+write.csv(KEGG_Tr_Sex_A, "results/Abdomen/KEGG_Abdomen.csv")
+```
+### Tr x Sex: GSEA
+
+```{r abdomen GSEA}
+res_A <- as.data.frame(res_Tr_Sex_A_shrunk)
+res_A <- res_A %>% dplyr::filter(!is.na(padj))
+
+genes_A_ranked <- sign(res_A$log2FoldChange)*(-log10(res_A$pvalue)) 
+names(genes_A_ranked) <- row.names(res_A)
+
+genes_A_ranked <- sort(genes_A_ranked, decreasing = TRUE) # sort genes by ranking
+gse_A <- GSEA(genes_A_ranked, TERM2GENE = go_annotations_Ab, eps=1e-300)
+write.csv(gse_A, "results/Abdomen/gse_A.csv")
+```
+
+### Interaction type
+Create a new dataframe with rapamycin effects in males and females
+
+```{r}
+merged_dfA_test <- merge(res_Tr_Sex_A_Sig_df, 
+                    as.data.frame(res_Tr_Mal_A) %>% 
+                      dplyr::select("log2FoldChange.male" = log2FoldChange, padj_mal = padj), 
+                    by = 0, 
+                    all.x = TRUE) 
+row.names(merged_dfA_test) <- merged_dfA_test$Row.names
+merged_dfA_test <- subset(merged_dfA_test, select = -Row.names)
+
+merged_dfA_test <- merge(merged_dfA_test, 
+                    as.data.frame(res_Tr_Fem_A) %>% 
+                      dplyr::select("log2FoldChange.female" = log2FoldChange, padj_fem = padj), 
+                    by = 0, 
+                    all.x = TRUE) 
+
+row.names(merged_dfA_test) <- merged_dfA_test$Row.names
+merged_dfA_test <- subset(merged_dfA_test, select = -Row.names)
+```
+
+## HEAD
+
+### Treatment effect in female head
+
+```{r treatment effect in female head}
+res_Tr_Fem_H <-  readRDS("results/Female_Head/res_Tr_Fem_H")
+res_Tr_Fem_H_Ordered <- res_Tr_Fem_H[order(res_Tr_Fem_H$pvalue),]
+res_Tr_Fem_H_Sig <- subset(res_Tr_Fem_H_Ordered, padj < 0.05)
+```
+
+
+### Treatment effect in male head
+
+```{r treatment effect in male head}
+res_Tr_Mal_H <- readRDS("results/Male_Head/res_Tr_Mal_H")
+res_Tr_Mal_H_Ordered <- res_Tr_Mal_H[order(res_Tr_Mal_H$pvalue),]
+res_Tr_Mal_H_Sig <- subset(res_Tr_Mal_H_Ordered, padj < 0.05)
+```
+
+### Interaction DESeqDataSet
+
+```{r Head dds}
+dds_H <- DESeqDataSetFromMatrix(countData = cts_H,
+                              colData = coldata_H,
+                              design = ~ Sex * Treatment * Species) 
+keep <- rowSums(counts(dds_H)) >= 1 #minimal pre-filtering
+table(keep)
+dds_H <- dds_H[keep,]
+
+```
+
+### Head MDS
+
+```{r, fig.width=8, fig.height=6}
+vst_H <- vst(dds_H, blind = TRUE)
+sampleDists <- dist(t(assay(vst_H))) 
+
+#dist computes the euclidean distance matrix.
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities
+
+#mds1 <- cbind(as.data.frame(colData(vst_H)), cmdscale(sampleDistMatrix))
+mds <- cbind(as.data.frame(colData(vst_H)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+```
+
+```{r}
+head_mds_plt_2 <- ggplot(mds, aes(x = `1`, y = `2`, color = Sex, shape = Treatment, fill = Species)) +
+  geom_point(size = 4,  stroke = 1.5)+
+  coord_fixed() +
+  labs(
+    x = paste0("Dimension 1 (", Dim1, "%)"),
+    y = paste0("Dimension 2 (", Dim2, "%)"),
+    color = "Sex",
+    shape = "Treatment",
+    fill = "mtDNA"
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Control" = 21,
+      "Rapa" = 22
+    ),
+    limits = c( "Control", "Rapa"),
+    labels = c("Control", "Rapamycin")
+  ) +
+
+  scale_color_manual(values = c("Female" = "salmon", "Male" = "cyan4")) +
+  scale_fill_manual(values = c("SO" = "darkgrey", "OO" = "white"), 
+                    breaks = c("SO", "OO"),  # Specify breaks for the legend
+                    labels = c("foreign (sm21)", "native (OreR)")) + 
+  theme_minimal() +  
+  theme(
+    legend.position = "right",  
+    legend.title = element_text(size = 12), 
+    legend.text = element_text(size = 10), 
+    
+    plot.title = element_text(size = 14, face = "bold"),  
+
+    
+    axis.text.x = element_text(size = 10),  
+    axis.text.y = element_text(size = 10),  
+    axis.title = element_text(size = 14),  
+   
+    
+  )+
+  guides(
+    shape = guide_legend(order = 2),  # Set the order of mtDNA in legend
+    color = guide_legend(order = 1),
+    fill = guide_legend(
+    override.aes = list(
+      shape = c(21, 21),  # Use shape 21 (filled circle) 
+      color = c("#999999", "#999999"),  # Set the colors for sm21 and oreR
+      fill = c("#999999", "white")  # Set the fill colors for sm21 and oreR
+    ),
+    title = "mtDNA", # Specify the legend title
+    order = 3))  
+
+head_mds_plt_2
+```
+
+### Treatment Sex Interaction
+
+```{r Head DESeq}
+dds_H <-  DESeq(dds_H)
+resultsNames(dds_H)
+```
+
+### Tr x Sex: DEGs
+
+```{r treatment x sex interaction in Head}
+res_Tr_Sex_H <- results(dds_H, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh, name="SexMale.TreatmentControl", filterFun=ihw) 
+# the interaction term, answering: is the treatment effect *different* across sexes?
+summary(res_Tr_Sex_H)
+
+res_Tr_Sex_H_shrunken <- lfcShrink(dds_H, coef="SexMale.TreatmentControl", type="apeglm")
+plotMA(res_Tr_Sex_H, ylim=c(-2,2))
+plotMA(res_Tr_Sex_H_shrunken, ylim=c(-2,2))
+
+res_Tr_Sex_H_Ordered <- res_Tr_Sex_H[order(res_Tr_Sex_H$pvalue),]
+res_Tr_Sex_H_Sig <- subset(res_Tr_Sex_H_Ordered, padj < 0.05)
+
+write.csv(res_Tr_Sex_H_Sig, "results/Head/SexTreatment.csv")
+
+res_Tr_Sex_H_shrunk <- lfcShrink(dds_H, coef="SexMale.TreatmentControl", type="apeglm") 
+summary(res_Tr_Sex_H_shrunk)
+plotMA(res_Tr_Sex_H, ylim=c(-2,2))
+plotMA(res_Tr_Sex_H_shrunk, ylim=c(-2,2))
+
+```
+
+### Tr x Sex: Volcano
+
+```{r, fig.height=6, fig.width=4}
+head_volcano1 <- EnhancedVolcano(res_Tr_Sex_H,
+  lab = convertFBids(row.names(res_Tr_Sex_H)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Sex x Treatment in Head',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+head_volcano2 <- EnhancedVolcano(res_Tr_Sex_H_shrunk,
+  lab = convertFBids(row.names(res_Tr_Sex_H_shrunk)),
+  x = 'log2FoldChange',
+  y = 'pvalue',
+  title = 'Sex x Treatment in Head',
+  legendPosition = 'bottom',
+  legendLabSize = 12,
+  legendIconSize = 4.0)
+cowplot::plot_grid(head_volcano1, head_volcano2, ncol=2)
+```
+
+### Tr x Sex: GO enrichment
+
+```{r, fig.height=10, fig.width=6}
+GO_Tr_Sex_H <- enrichGO(row.names(res_Tr_Sex_H_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_H, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Sex_H_simp <- simplify(GO_Tr_Sex_H, cutoff = .7)
+
+saveRDS(GO_Tr_Sex_H_simp, file = "results/Head/GO_Head_simp_df")
+write.csv(GO_Tr_Sex_H_simp, "results/Head/GO_Head.csv")
+```
+
+
+### Tr x Sex: KEGG enrichment
+
+```{r, fig.height=8, fig.width=6}
+ids_Tr_Sex_H_Sig <- bitr(row.names(res_Tr_Sex_H_Sig), fromType = "FLYBASE", toType = "ENTREZID", OrgDb=org.Dm.eg.db) 
+universe_H_entrez <- bitr(gene_universe_H, fromType = "FLYBASE", toType = "ENTREZID", OrgDb=org.Dm.eg.db) 
+
+KEGG_Tr_Sex_H <- enrichKEGG(gene=ids_Tr_Sex_H_Sig$ENTREZID, organism="dme", 
+                 pvalueCutoff = 0.05, pAdjustMethod = "BH",
+                 keyType = "ncbi-geneid", universe = universe_A_entrez$ENTREZID)
+
+write.csv(KEGG_Tr_Sex_H, "results/Head/KEGG_Head.csv")
+```
+### Tr x Sex: GSEA
+
+```{r head GSEA}
+res_H <- as.data.frame(res_Tr_Sex_H_shrunk)
+res_H <- res_H %>% dplyr::filter(!is.na(padj))
+
+genes_H_ranked <- sign(res_H$log2FoldChange)*(-log10(res_H$pvalue)) 
+names(genes_H_ranked) <- row.names(res_H)
+
+genes_H_ranked <- sort(genes_H_ranked, decreasing = TRUE) # sort genes by ranking
+gse_H <- GSEA(genes_H_ranked, TERM2GENE = go_annotations_Hd, eps=1e-300)
+write.csv(gse_H, "results/Head/gse_H.csv")
+```
+
+### Interaction type
+Create a new dataframe with rapamycin effects in males and females
+
+```{r}
+merged_dfH_test <- merge(res_Tr_Sex_H_Sig_df, 
+                    as.data.frame(res_Tr_Mal_H) %>% 
+                      dplyr::select("log2FoldChange.male" = log2FoldChange, padj_mal = padj), 
+                    by = 0, 
+                    all.x = TRUE) 
+row.names(merged_dfH_test) <- merged_dfH_test$Row.names
+merged_dfH_test <- subset(merged_dfH_test, select = -Row.names)
+
+merged_dfH_test <- merge(merged_dfH_test, 
+                    as.data.frame(res_Tr_Fem_H) %>% 
+                      dplyr::select("log2FoldChange.female" = log2FoldChange, padj_fem = padj), 
+                    by = 0, 
+                    all.x = TRUE) 
+
+row.names(merged_dfH_test) <- merged_dfH_test$Row.names
+merged_dfH_test <- subset(merged_dfH_test, select = -Row.names)
+```
+
+## Results
+
+### MDS
+
+```{r, fig.width=8, fig.height=10}
+tissuesMDS <- cowplot::plot_grid(thorax_mds_plt_2, head_mds_plt_2, abdomen_mds_plt_2,  ncol=1, align="hv",
+                                 labels=c("A", "B", "C"), label_size=20)
+
+ggsave("tissuesMDS.pdf", plot = tissuesMDS, width = 8.5, height = 11, dpi = 300)
+```
+
+
+
+### Intersections
+
+####Upset plots
+
+```{r}
+treatment_sex_interaction <- list(
+  "Head" = row.names(res_Tr_Sex_H_Sig), 
+  "Thorax" = row.names(res_Tr_Sex_T_Sig),
+  "Abdomen" = row.names(res_Tr_Sex_A_Sig)
+  )
+
+treatment_sex_interaction_GO <- list(
+  "Head" = as.data.frame(GO_Tr_Sex_H_simp)$ID, 
+  "Thorax" = as.data.frame(GO_Tr_Sex_T_simp)$ID,
+  "Abdomen" = as.data.frame(GO_Tr_Sex_A_simp)$ID
+  )
+
+pdf(file="degs_intersection_upset.pdf",
+    width = 7,
+    height = 4,
+    onefile=FALSE) 
+upset(
+                                fromList(treatment_sex_interaction),
+                                group.by=c("degree"),
+                                main.bar.color = "#984ea3", 
+                                sets.bar.color = "#ff7f00",
+                                matrix.color = "#984ea3",
+                                att.color = "black",
+                                mainbar.y.label = "Intersection Size",
+                                sets.x.label = "Total DEGs",
+                                text.scale = 1.4,
+                                set_size.show=TRUE, keep.order=TRUE,
+                                order.by = c( "degree"),
+                                decreasing=F,
+                                set_size.scale_max = 1120,
+                                point.size = 2.8
+                                )
+
+dev.off()
+pdf(file="GO_intersection_upset.pdf",
+    width = 7,
+    height = 4,
+    onefile=FALSE) 
+
+upset(
+                                fromList(treatment_sex_interaction_GO),
+                                empty.intersections = 'on',
+                                group.by=c("degree"),
+                                main.bar.color = "#984ea3", 
+                                sets.bar.color = "#ff7f00",
+                                matrix.color = "#984ea3",
+                                att.color = "black",
+                                mainbar.y.label = "Intersection Size",
+                                sets.x.label = "Total GO Categories",
+                                text.scale = 1.4,
+                                set_size.show=TRUE, keep.order=TRUE,
+                                order.by = c( "degree"),
+                                decreasing=F,
+                                set_size.scale_max = 40,
+                                point.size = 2.8
+                                )
+dev.off()
+
+
+```
+
+
+### GO Enrichment 
+
+```{r, fig.height=30, fig.width=18}
+# Define color palette 
+colors <- c(low = '#e41a1c', mid ="#984ea3", high = '#377eb8')
+
+# Create the abdomen bar plot
+abdomen_GO_plot <- as.data.frame(GO_Tr_Sex_A_simp) %>%
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 20) %>%
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"],  high = colors["high"], breaks = c(0.01,  0.02)) +
+  ylab('DE Gene Count') +
+  coord_flip() +
+  # ggtitle('Abdomen') +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    legend.key.size = unit(1, "cm"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 22),  #x-axis
+    axis.text.y = element_text(size = 25),  #y-axis
+    axis.title.x = element_text(size = 28),  #y-axis title
+    legend.text = element_text(size = 22),  #legend text
+    legend.title = element_text(size = 24)
+  ) 
+
+thorax_GO_plot <- as.data.frame(GO_Tr_Sex_T_simp) %>%
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 20) %>%
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"], high = colors["high"], breaks = c(0.01,  0.03)) +
+  ylab('DE Gene Count') +
+  coord_flip() +
+  #ggtitle('Thorax') +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    legend.key.size = unit(1, "cm"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 22),  #x-axis
+    axis.text.y = element_text(size = 25),  #y-axis
+    axis.title.x = element_text(size = 28),  #y-axis title
+    # plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 22),  #legend text
+    legend.title = element_text(size = 24)
+  ) 
+
+head_GO_plot <- as.data.frame(GO_Tr_Sex_H_simp) %>%
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 20) %>%
+  ## mutate(Description = str_to_title(Description)) %>% 
+  mutate(Descr = str_wrap(Description, width = 35)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"], high = colors["high"], breaks = c(0.004,  0.008)) +
+  ylab('DE Gene Count') +
+  coord_flip() +
+  #ggtitle('Head') +
+  guides(fill = guide_colorbar(title = "FDR")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "top",
+    legend.key.size = unit(1, "cm"),
+
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 22),  #x-axis
+    axis.text.y = element_text(size = 25),  #y-axis
+    axis.title.x = element_text(size = 28),  #y-axis title
+    # plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 22),  #legend text
+    legend.title = element_text(size = 24)
+  ) 
+
+go_enrichment_plot <- cowplot::plot_grid(thorax_GO_plot, head_GO_plot, abdomen_GO_plot, 
+                                         ncol=3, 
+                                         labels=c("A", "B", "C"),
+                                         label_size=30)    
+go_enrichment_plot
+ggsave("SexTreatment_GO_Enrich.pdf", plot = go_enrichment_plot, width = 30, height = 18, dpi = 300)
+```
+
+### KEGG enrichment
+
+```{r}
+
+abdomen_KEGG_plot <- as.data.frame(KEGG_Tr_Sex_A) %>%
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 20) %>%
+  mutate(Description = str_to_lower(Description)) %>%
+  mutate(Description = gsub(" - drosophila melanogaster \\(fruit fly\\)", "", Description)) %>% 
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"], high = colors["high"]) +
+  ylab('DEG count') +
+  coord_flip() +
+  #ggtitle('Abdomen') +
+  guides(fill = guide_colorbar(title = "Adjusted\np-value")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "right",
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 22),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.x = element_text(size = 20),  #y-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 18),  #legend text
+  ) 
+
+thorax_KEGG_plot <- as.data.frame(KEGG_Tr_Sex_T) %>%
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 20) %>%
+  mutate(Description = str_to_lower(Description)) %>%
+  mutate(Description = gsub(" - drosophila melanogaster \\(fruit fly\\)", "", Description)) %>% 
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"], high = colors["high"]) +
+  ylab('DEG count') +
+  coord_flip() +
+  #ggtitle('Thorax') +
+  guides(fill = guide_colorbar(title = "Adjusted\np-value")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "right",
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 22),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.x = element_text(size = 20),  #y-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 18),  #legend text
+  ) 
+
+head_KEGG_plot <- as.data.frame(KEGG_Tr_Sex_H) %>%
+  arrange(p.adjust) %>%
+  slice_min(p.adjust, n = 20) %>%
+  mutate(Description = str_to_lower(Description)) %>%
+  mutate(Description = gsub(" - drosophila melanogaster \\(fruit fly\\)", "", Description)) %>% 
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, -p.adjust), Count, fill = p.adjust)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_gradient(low = colors["low"], high = colors["high"]) +
+  ylab('DEG count') + 
+  coord_flip() +
+  #ggtitle('Head') +
+  guides(fill = guide_colorbar(title = "Adjusted\np-value")) + 
+  theme_minimal() +  # Use minimal theme
+  theme(
+    legend.position = "right",
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 22),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.x = element_text(size = 20),  #y-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 18),  #legend text
+  ) 
+
+kegg_enrichment_plot <- cowplot::plot_grid(thorax_KEGG_plot, head_KEGG_plot, abdomen_KEGG_plot, 
+                                           ncol=1, labels=c("A", "B", "C"), 
+                                           label_size=25)    
+
+ggsave("SexTreatment_Kegg_Enrich.pdf", plot = kegg_enrichment_plot, width = 8.5, height = 11, dpi = 300)
+
+```
+
+
+```{r, fig.height=17, fig.width=30}
+sextreatment_enrichment_plot <- cowplot::plot_grid(thorax_GO_plot, head_GO_plot, abdomen_GO_plot, 
+                                                   thorax_KEGG_plot, head_KEGG_plot, abdomen_KEGG_plot, 
+                                                   ncol=3, labels=c("A", "B", "C", "D", "E", "F"), 
+                                                   label_size=25, rel_heights = c(2,.9))                  
+
+ggsave("SexTreatment_Enrich.pdf", plot = sextreatment_enrichment_plot, width = 30, height = 17, dpi = 300)
+```
+
+### Fold change comparisons of main effects
+
+```{r}
+merged_dfT_test <- merged_dfT_test %>%
+  mutate(padj_combination = case_when(
+    padj_mal < 0.05 & padj_fem < 0.05 ~ "In Males & Females",
+    padj_mal < 0.05 ~ "In Males Only",
+    padj_fem < 0.05 ~ "In Females Only",
+    TRUE ~ "In Neither"  # If none of the conditions are met
+  ))
+merged_dfT_test$padj_combination <- factor(merged_dfT_test$padj_combination)
+write.csv(merged_dfT_test, "results/Thorax/SexTreatment_WithMain.csv")
+
+
+merged_dfA_test <- merged_dfA_test %>%
+  mutate(padj_combination = case_when(
+    padj_mal < 0.05 & padj_fem < 0.05 ~ "In Males & Females",
+    padj_mal < 0.05 ~ "In Males Only",
+    padj_fem < 0.05 ~ "In Females Only",
+    TRUE ~ "In Neither"  # If none of the conditions are met
+  ))
+merged_dfA_test$padj_combination <- factor(merged_dfA_test$padj_combination)
+write.csv(merged_dfA_test, "results/Abdomen/SexTreatment_WithMain.csv")
+
+merged_dfH_test <- merged_dfH_test %>%
+  mutate(padj_combination = case_when(
+    padj_mal < 0.05 & padj_fem < 0.05 ~ "In Males & Females",
+    padj_mal < 0.05 ~ "In Males Only",
+    padj_fem < 0.05 ~ "In Females Only",
+    TRUE ~ "In Neither"  # If none of the conditions are met
+  ))
+merged_dfH_test$padj_combination <- factor(merged_dfH_test$padj_combination)
+write.csv(merged_dfH_test, "results/Head/SexTreatment_WithMain.csv")
+
+```
+
+
+```{r}
+colors <- c("In Males & Females" = "black", "In Neither" = "gray", "In Males Only"="cyan4",  "In Females Only" = "lightcoral")
+
+FC.T.scored <- ggplot(merged_dfT_test, aes(x = log2FoldChange.male, y = log2FoldChange.female, color = padj_combination)) +
+  geom_point(alpha = 0.7, size = 2) +  # Adjust transparency, point size, shape, and color
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black") +  # Add vertical line at x=0
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +  # Add horizontal line at y=0
+  scale_color_manual(values = colors) +  # Use custom color palette
+  labs(x = "Fold change in Males", y = "Fold change in Females", color = "DE by Rapamycin:") +  # Update axis labels and legend title
+  guides(color = FALSE) +
+  theme_minimal() +  # Apply a minimal theme
+  theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank(),  # Remove minor gridlines
+    legend.position = "top",  # Keep legend on top
+    axis.text.x = element_text(size = 12,  hjust = 1),  # Adjust font size and angle for x-axis labels
+    axis.text.y = element_text(size = 12),  # Adjust font size for y-axis labels
+    axis.title = element_text(size = 14),  # Adjust font size for axis titles
+    plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Adjust font size and alignment for plot title
+    legend.text = element_text(size = 11)  # Adjust font size for legend text
+  )
+
+FC.A.scored <- ggplot(merged_dfA_test, aes(x = log2FoldChange.male, y = log2FoldChange.female, color = padj_combination)) +
+  geom_point(alpha = 0.7, size = 2) +  # Adjust transparency, point size, shape, and color
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black") +  # Add vertical line at x=0
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +  # Add horizontal line at y=0
+  scale_color_manual(values = colors) +  # Use custom color palette
+  labs(x = "Fold change in Males", y = "Fold change in Females", color = "DE by Rapamycin:") +  # Update axis labels and legend title
+  theme_minimal() +  # Apply a minimal theme
+  theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank(),  # Remove minor gridlines
+    legend.position = "bottom",  # Keep legend on top
+    axis.text.x = element_text(size = 12,  hjust = 1),  # Adjust font size and angle for x-axis labels
+    axis.text.y = element_text(size = 12),  # Adjust font size for y-axis labels
+    axis.title = element_text(size = 14),  # Adjust font size for axis titles
+    plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Adjust font size and alignment for plot title
+    legend.text = element_text(size = 11)  # Adjust font size for legend text
+  )
+
+FC.H.scored <- ggplot(merged_dfH_test, aes(x = log2FoldChange.male, y = log2FoldChange.female, color = padj_combination)) +
+  geom_point(alpha = 0.7, size = 2) +  # Adjust transparency, point size, shape, and color
+  geom_vline(xintercept = 0, linetype = "dotted", color = "black") +  # Add vertical line at x=0
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +  # Add horizontal line at y=0
+  scale_color_manual(values = colors) +  # Use custom color palette
+  labs(x = "Fold change in Males", y = "Fold change in Females", color = "DE by Rapamycin:") +  # Update axis labels and legend title
+  guides(color = FALSE) +
+  theme_minimal() +  # Apply a minimal theme
+  theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank(),  # Remove minor gridlines
+    legend.position = "top",  # Keep legend on top
+    axis.text.x = element_text(size = 12,  hjust = 1),  # Adjust font size and angle for x-axis labels
+    axis.text.y = element_text(size = 12),  # Adjust font size for y-axis labels
+    axis.title = element_text(size = 14),  # Adjust font size for axis titles
+    plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Adjust font size and alignment for plot title
+    legend.text = element_text(size = 11)  # Adjust font size for legend text
+  )
+
+```
+
+```{r, fig.height=4, fig.width=16}
+fold_change_plot_sex <-  FC.T.scored + FC.A.scored + FC.H.scored
+ggsave("fold_change_plot_sex.pdf", 
+       fold_change_plot_sex,
+       width = 14,
+       height = 4)
+```
+
+
+```{r session_info}
+devtools::session_info()
+```
+
+This document was processed on: `r Sys.Date()`

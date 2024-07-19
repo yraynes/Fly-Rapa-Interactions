@@ -1,0 +1,1108 @@
+---
+title: "Rapamycin Main Effect by Sex-Tissue combination"
+author: "Yevgeniy Raynes"
+output:
+  html_document:
+    toc: true
+params:
+   FDR: 0.05
+   LFC: 0.0
+date: "2023-10-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+FDR.Thresh <- params$FDR
+LFC.Thresh <- params$LFC
+set.seed(1234)
+```
+
+## Load packages.
+This document depends on the following packages:
+```{r, message=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(apeglm)
+library(eulerr)
+library(EnhancedVolcano)
+library(flybaseR)
+library(drosophila2.db)
+library("org.Dm.eg.db")
+library(AnnotationDbi)
+library(repr)
+library(vsn)
+library(pheatmap)
+library(WGCNA)
+library(clusterProfiler)
+library(DEGreport)
+source("../edgeR/FBidsTOSymbol.R")
+library(RNAseqQC)
+library(ensembldb)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(magrittr)
+library(simplifyEnrichment)
+library(stats)
+library(msigdbr)
+library(GO.db)
+library(ggridges)
+library(enrichplot)
+library(ggupset)
+library(gplots)
+library(UpSetR)
+library(rrvgo)
+library(IHW)
+library(patchwork)
+```
+
+## Read count tables/group info into R.
+```{r data acquisition}
+cts <- as.matrix(read.csv("rapa_count_table.csv", row.names = 1))
+cts <- subset(cts, select = -OOFCH4) #remove OOFCH4
+
+length(rownames(cts[rowSums(cts)>0, ]))
+
+coldata <- read.csv("rapa_group_data.csv", row.names = 1)
+coldata <- coldata[colnames(cts),]
+
+coldata$Treatment <- as.factor(coldata$Treatment)
+coldata$Tissue <- as.factor(coldata$Tissue)
+coldata$Species <- as.factor(coldata$Species)
+coldata$Group <- as.factor(coldata$Group)
+coldata$Sex <- as.factor(coldata$Sex)
+
+coldata$GenoTreat <- as.factor(paste0(coldata$Species, substring(coldata$Treatment,1,3)))
+coldata$SexTreatment <- as.factor(paste0(coldata$Sex, coldata$Treatment))
+
+```
+
+### Go annotations set up
+
+```{r set up GO annotations}
+
+orgDb=org.Dm.eg.db
+columns(orgDb)
+
+all_flybase_ids <- keys(orgDb, keytype = "FLYBASE")
+
+go_annotations <- select(orgDb, keys = all_flybase_ids, columns = c("FLYBASE", "GO"), keytype = "FLYBASE")
+kegg_annotations <- select(orgDb, keys = all_flybase_ids, columns = c("FLYBASE", "PATH"), keytype = "FLYBASE")
+kegg_annotations <- na.omit(kegg_annotations)
+
+go_annotations <- go_annotations %>% 
+  dplyr::filter(ONTOLOGY=="BP")
+
+go_annotations <- go_annotations[, c("GO","FLYBASE")]
+go_annotations <- na.omit(go_annotations)
+
+go_annotations$TERM <- select(GO.db, keys = go_annotations$GO, columns = "TERM", keytype = "GOID")$TERM
+go_annotations <- go_annotations[, c("TERM", "FLYBASE", "GO")]
+
+go_annotations$NAME <- paste(go_annotations$GO, go_annotations$TERM, sep=" ")
+go_annotations <- go_annotations[,c("NAME","FLYBASE")]
+
+```
+
+## Female Heads
+
+```{r subset count data to female heads}
+
+cts_fh <- cts[,substring(colnames(cts), 3, 3)=="F" & substring(colnames(cts), 5, 5)=="H"] 
+coldata_fh <- coldata[colnames(cts_fh),]
+
+gene_universe_fh <- rownames(cts[rowSums(cts_fh)>0, ])
+length(gene_universe_fh)
+
+ifelse(!dir.exists("results/Female_Head"), dir.create("results/Female_Head", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_fh, "results/Female_Head/gene_universe_fh.txt")
+
+go_annotations_fh <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_fh)
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_fh) %in% colnames(cts_fh)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_fh) == colnames(cts_fh)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+```{r make a new DESeqDataSet for female heads}
+dds_fh <- DESeqDataSetFromMatrix(countData = cts_fh,
+                              colData = coldata_fh,
+                              design = ~ Species + Treatment) 
+
+keep <- rowSums(counts(dds_fh)) >= 1 #minimal pre-filtering
+dds_fh <- dds_fh[keep,]
+```
+
+### Female Heads MDS
+
+```{r, fig.width=8, fig.height=6}
+
+vst_fh <- vst(dds_fh, blind = TRUE)
+
+sampleDists <- dist(t(assay(vst_fh))) 
+
+#dist computes the euclidean distance matrix.
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities
+
+mds <- cbind(as.data.frame(colData(vst_fh)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+
+
+fh_mds <- ggplot(mds, aes(x = `1`, y = `2`, color = Treatment , shape = Species)) +
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("Dim 1 (",Dim1,"%)")) +
+  ylab(paste0("Dim 2 (",Dim2,"%)")) +
+  ggtitle("MDS Female Head")+ 
+  theme_minimal() + scale_color_brewer(palette = "Set1")
+
+```
+
+
+### Differential expression analysis
+
+```{r differential expression analysis: female heads}
+dds_fh <- DESeq(dds_fh)
+resultsNames(dds_fh)
+```
+
+### Treatment contrast female heads
+
+```{r treatment DEGs female heads}
+res_Tr_Fem_H <- results(dds_fh, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh, filterFun=ihw,
+               contrast=c("Treatment","Rapa","Control"))
+
+summary(res_Tr_Fem_H)
+
+saveRDS(res_Tr_Fem_H, "results/Female_Head/res_Tr_Fem_H.rds.rds")
+
+res_Tr_Fem_H_Ordered <- res_Tr_Fem_H[order(res_Tr_Fem_H$pvalue),]
+res_Tr_Fem_H_Sig <- subset(res_Tr_Fem_H_Ordered, padj < FDR.Thresh)
+
+write.csv(res_Tr_Fem_H_Sig, "results/Female_Head/rapa.csv")
+```
+
+### GO enrichment Female Heads
+
+```{r, fig.height=9, fig.width=10}
+GO_Tr_Fem_H <- enrichGO(row.names(res_Tr_Fem_H_Sig), OrgDb=org.Dm.eg.db, 
+                        universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_H_simp <- simplify(GO_Tr_Fem_H, cutoff = .7)
+
+upreg_Fem_H <- subset(res_Tr_Fem_H_Sig, log2FoldChange>0)
+downreg_Fem_H <- subset(res_Tr_Fem_H_Sig, log2FoldChange<0)
+
+GO_Tr_Fem_H_UP <- enrichGO(row.names(upreg_Fem_H), OrgDb=org.Dm.eg.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_H_UP_simp <- simplify(GO_Tr_Fem_H_UP)
+write.csv(GO_Tr_Fem_H_UP_simp, "results/Female_Head/UP_GO.csv")
+
+
+GO_Tr_Fem_H_DOWN <- enrichGO(row.names(downreg_Fem_H), OrgDb=org.Dm.eg.db, universe = gene_universe_fh, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_H_DOWN_simp <- simplify(GO_Tr_Fem_H_DOWN)
+write.csv(GO_Tr_Fem_H_DOWN_simp, "results/Female_Head/DOWN_GO.csv")
+```
+
+```{r, fig.height=10, fig.width=10}
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+
+# Create the bar plot
+fem_hd_plot <- as.data.frame(GO_Tr_Fem_H_UP_simp) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n = 10) %>%
+  bind_rows(as.data.frame(GO_Tr_Fem_H_DOWN_simp) %>%
+              slice_min(p.adjust, n = 10) %>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated', -1, 1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  
+  scale_fill_manual(values = colp) +  
+  ylab('log10 FDR') + xlab('Ontology') +
+  coord_flip() +
+  ggtitle('Female Head') +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+
+    legend.position = "top",
+    
+    axis.text.x = element_text(size = 20),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.y = element_text(size = 20),  #y-axis title
+    axis.title.x = element_text(size = 20),  #x-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 15),  #legend text
+  ) 
+
+fem_hd_plot
+```
+
+## Male Heads
+
+```{r subset count data to male heads}
+
+cts_mh <- cts[,substring(colnames(cts), 3, 3)=="M" & substring(colnames(cts), 5, 5)=="H"] 
+coldata_mh <- coldata[colnames(cts_mh),]
+
+gene_universe_mh <- rownames(cts[rowSums(cts_mh)>0, ])
+length(gene_universe_mh)
+
+ifelse(!dir.exists("results/Male_Head"), dir.create("results/Male_Head", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_mh, "results/Male_Head/gene_universe_mh.txt")
+
+go_annotations_mh <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_mh)
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_mh) %in% colnames(cts_mh)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_mh) == colnames(cts_mh)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+```{r make a new DESeqDataSet for male heads}
+dds_mh <- DESeqDataSetFromMatrix(countData = cts_mh,
+                              colData = coldata_mh,
+                              design = ~ Species + Treatment) 
+
+keep <- rowSums(counts(dds_mh)) >= 1 #minimal pre-filtering
+dds_mh <- dds_mh[keep,]
+```
+
+### Male Heads MDS
+
+```{r, fig.width=8, fig.height=6}
+
+vst_mh <- vst(dds_mh, blind = TRUE)
+
+sampleDists <- dist(t(assay(vst_mh))) 
+
+#dist computes the euclidean distance matrix.
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities
+
+mds <- cbind(as.data.frame(colData(vst_mh)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+
+mh_mds <- ggplot(mds, aes(x = `1`, y = `2`, color = Treatment , shape = Species)) +
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("Dim 1 (",Dim1,"%)")) +
+  ylab(paste0("Dim 2 (",Dim2,"%)")) +
+  ggtitle("MDS Male Head")+ 
+  theme_minimal() + scale_color_brewer(palette = "Set1")
+```
+
+
+### Differential expression analysis
+
+```{r differential expression analysis: male heads}
+dds_mh <- DESeq(dds_mh)
+resultsNames(dds_mh)
+```
+
+### Treatment contrast male heads
+
+```{r treatment DEGs male heads}
+res_Tr_Mal_H <- results(dds_mh, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,filterFun=ihw,
+               contrast=c("Treatment","Rapa","Control"))
+summary(res_Tr_Mal_H)
+saveRDS(res_Tr_Mal_H, "results/Male_Head/res_Tr_Mal_H.rds.rds")
+
+res_Tr_Mal_H_Ordered <- res_Tr_Mal_H[order(res_Tr_Mal_H$pvalue),]
+res_Tr_Mal_H_Sig <- subset(res_Tr_Mal_H_Ordered, padj < FDR.Thresh)
+
+write.csv(res_Tr_Mal_H_Sig, "results/Male_Head/rapa.csv")
+```
+
+### GO enrichment Male Heads
+
+```{r, fig.height=9, fig.width=10}
+GO_Tr_Mal_H <- enrichGO(row.names(res_Tr_Mal_H_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_H_simp <- simplify(GO_Tr_Mal_H, cutoff = .7)
+
+upreg_Mal_H <- subset(res_Tr_Mal_H_Sig, log2FoldChange>0)
+downreg_Mal_H <- subset(res_Tr_Mal_H_Sig, log2FoldChange<0)
+
+GO_Tr_Mal_H_UP <- enrichGO(row.names(upreg_Mal_H), OrgDb=org.Dm.eg.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_H_UP
+#no enriched categories
+
+GO_Tr_Mal_H_DOWN <- enrichGO(row.names(downreg_Mal_H), OrgDb=org.Dm.eg.db, universe = gene_universe_mh, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_H_DOWN_simp <- simplify(GO_Tr_Mal_H_DOWN)
+write.csv(GO_Tr_Mal_H_DOWN_simp, "results/Male_Head/DOWN_GO.csv")
+```
+
+```{r, fig.height=10, fig.width=10}
+# Define color palette 
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+# Create the bar plot
+mal_hd_plot <- as.data.frame(GO_Tr_Mal_H_DOWN_simp) %>%
+  mutate(Effect = 'Downregulated') %>%
+  slice_min(p.adjust, n = 20) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated', -1, 1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  
+  scale_fill_manual(values = colp) +  
+  ylab('log10 FDR') + xlab('Ontology') +
+  coord_flip() +
+  ggtitle('Male Head') +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  
+  theme(
+
+    legend.position = "top",
+    
+    axis.text.x = element_text(size = 20),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.y = element_text(size = 20),  #y-axis title
+    axis.title.x = element_text(size = 20),  #x-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 15),  #legend text
+  ) 
+
+mal_hd_plot
+```
+
+## Female Thorax
+
+
+```{r subset count data to female thorax}
+cts_ft <- cts[,substring(colnames(cts), 3, 3)=="F" & substring(colnames(cts), 5, 5)=="T"] 
+coldata_ft <- coldata[colnames(cts_ft),]
+
+gene_universe_ft <- rownames(cts[rowSums(cts_ft)>0, ])
+length(gene_universe_ft)
+
+ifelse(!dir.exists("results/Female_Thorax"), dir.create("results/Female_Thorax", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_ft, "results/Female_Thorax/gene_universe_ft.txt")
+
+go_annotations_ft <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_ft)
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_ft) %in% colnames(cts_ft)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_ft) == colnames(cts_ft)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+```{r make a new DESeqDataSet for female thorax}
+dds_ft <- DESeqDataSetFromMatrix(countData = cts_ft,
+                              colData = coldata_ft,
+                              design = ~ Species + Treatment) 
+
+keep <- rowSums(counts(dds_ft)) >= 1 #minimal pre-filtering
+dds_ft <- dds_ft[keep,]
+```
+
+### Female Thorax MDS
+
+```{r, fig.width=8, fig.height=6}
+
+vst_ft <- vst(dds_ft, blind = TRUE)
+
+sampleDists <- dist(t(assay(vst_ft))) 
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+
+mds <- cbind(as.data.frame(colData(vst_ft)), mds_dist$points)
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+
+ft_mds <- ggplot(mds, aes(x = `1`, y = `2`, color = Treatment , shape = Species)) +
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("Dim 1 (",Dim1,"%)")) +
+  ylab(paste0("Dim 2 (",Dim2,"%)")) +
+  ggtitle("MDS Female Thorax")+ 
+  theme_minimal() + scale_color_brewer(palette = "Set1")
+```
+
+
+### Differential expression analysis
+
+```{r differential expression analysis: female thorax}
+dds_ft <- DESeq(dds_ft)
+resultsNames(dds_ft)
+```
+
+### Treatment contrast female thorax
+
+```{r treatment DEGs female thorax}
+res_Tr_Fem_T <- results(dds_ft, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,filterFun=ihw,
+               contrast=c("Treatment","Rapa","Control"))
+summary(res_Tr_Fem_T)
+saveRDS(res_Tr_Fem_T, "results/Female_Thorax/res_Tr_Fem_T.rds")
+res_Tr_Fem_T_Ordered <- res_Tr_Fem_T[order(res_Tr_Fem_T$pvalue),]
+res_Tr_Fem_T_Sig <- subset(res_Tr_Fem_T_Ordered, padj < FDR.Thresh)
+
+write.csv(res_Tr_Fem_T_Sig, "results/Female_Thorax/rapa.csv")
+```
+
+### GO enrichment Female Thorax
+
+```{r, fig.height=9, fig.width=10}
+GO_Tr_Fem_T <- enrichGO(row.names(res_Tr_Fem_T_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_T_simp <- simplify(GO_Tr_Fem_T, cutoff = .7)
+
+upreg_Fem_T <- subset(res_Tr_Fem_T_Sig, log2FoldChange>0)
+downreg_Fem_T <- subset(res_Tr_Fem_T_Sig, log2FoldChange<0)
+
+GO_Tr_Fem_T_UP <- enrichGO(row.names(upreg_Fem_T), OrgDb=org.Dm.eg.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_T_UP_simp <- simplify(GO_Tr_Fem_T_UP)
+write.csv(GO_Tr_Fem_T_UP_simp, "results/Female_Thorax/UP_GO.csv")
+
+GO_Tr_Fem_T_DOWN <- enrichGO(row.names(downreg_Fem_T), OrgDb=org.Dm.eg.db, universe = gene_universe_ft, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_T_DOWN_simp <- simplify(GO_Tr_Fem_T_DOWN)
+write.csv(GO_Tr_Fem_T_DOWN_simp, "results/Female_Thorax/DOWN_GO.csv")
+```
+
+```{r, fig.height=10, fig.width=10}
+# Define color palette 
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+# Create the bar plot
+fem_th_plot <- as.data.frame(GO_Tr_Fem_T_UP_simp) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n = 10) %>%
+  bind_rows(as.data.frame(GO_Tr_Fem_T_DOWN_simp) %>%
+              slice_min(p.adjust, n = 10) %>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated', -1, 1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  
+  scale_fill_manual(values = colp) +  
+  ylab('log10 FDR') + xlab('Ontology') +
+  coord_flip() +
+  ggtitle('Female Thorax') +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() + 
+  theme(
+
+    legend.position = "top",
+    
+    axis.text.x = element_text(size = 20),  
+    axis.text.y = element_text(size = 16),  
+    axis.title.y = element_text(size = 20), 
+    axis.title.x = element_text(size = 20), 
+    plot.title = element_text(size = 22),  
+    legend.text = element_text(size = 15),  
+  ) 
+
+fem_th_plot
+```
+
+## Male Thorax
+
+```{r subset count data to male thorax}
+
+cts_mt <- cts[,substring(colnames(cts), 3, 3)=="M" & substring(colnames(cts), 5, 5)=="T"] 
+coldata_mt <- coldata[colnames(cts_mt),]
+
+gene_universe_mt <- rownames(cts[rowSums(cts_mt)>0, ])
+length(gene_universe_mt)
+
+ifelse(!dir.exists("results/Male_Thorax"), dir.create("results/Male_Thorax", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_mt, "results/Male_Thorax/gene_universe_mt.txt")
+
+go_annotations_mt <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_mt)
+
+#columns of the count matrix and the rows of the column data (information about samples) must be the same so check:
+all(rownames(coldata_mt) %in% colnames(cts_mt)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_mt) == colnames(cts_mt)) #are they in the same order?
+```
+
+### DESeqDataSet Object 
+```{r make a new DESeqDataSet for male thorax}
+dds_mt <- DESeqDataSetFromMatrix(countData = cts_mt,
+                              colData = coldata_mt,
+                              design = ~ Species + Treatment) 
+
+keep <- rowSums(counts(dds_mt)) >= 1 #minimal pre-filtering
+dds_mt <- dds_mt[keep,]
+```
+
+### Male Thorax MDS
+
+```{r, fig.width=8, fig.height=6}
+
+vst_mt <- vst(dds_mt, blind = TRUE)
+
+sampleDists <- dist(t(assay(vst_mt))) 
+
+#dist computes the euclidean distance matrix.
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities
+
+mds <- cbind(as.data.frame(colData(vst_mt)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by the first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by the second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+
+
+mt_mds <- ggplot(mds, aes(x = `1`, y = `2`, color = Treatment , shape = Species)) +
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("Dim 1 (",Dim1,"%)")) +
+  ylab(paste0("Dim 2 (",Dim2,"%)")) +
+  ggtitle("MDS Male Thorax")+ 
+  theme_minimal() + scale_color_brewer(palette = "Set1")
+```
+
+
+### Differential expression analysis
+
+```{r differential expression analysis: male thorax}
+dds_mt <- DESeq(dds_mt)
+resultsNames(dds_mt)
+```
+
+### Treatment contrast male thorax
+
+```{r treatment DEGs male thorax}
+res_Tr_Mal_T <- results(dds_mt, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,filterFun=ihw,
+               contrast=c("Treatment","Rapa","Control"))
+summary(res_Tr_Mal_T)
+saveRDS(res_Tr_Mal_T, "results/Male_Thorax/res_Tr_Mal_T.rds")
+
+res_Tr_Mal_T_Ordered <- res_Tr_Mal_T[order(res_Tr_Mal_T$pvalue),]
+res_Tr_Mal_T_Sig <- subset(res_Tr_Mal_T_Ordered, padj < FDR.Thresh)
+
+write.csv(res_Tr_Mal_T_Sig, "results/Male_Thorax/rapa.csv")
+```
+
+### GO enrichment Male Thorax
+
+```{r, fig.height=9, fig.width=10}
+GO_Tr_Mal_T <- enrichGO(row.names(res_Tr_Mal_T_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_T_simp <- simplify(GO_Tr_Mal_T, cutoff = .7)
+
+upreg_Mal_T <- subset(res_Tr_Mal_T_Sig, log2FoldChange>0)
+downreg_Mal_T <- subset(res_Tr_Mal_T_Sig, log2FoldChange<0)
+
+GO_Tr_Mal_T_UP <- enrichGO(row.names(upreg_Mal_T), OrgDb=org.Dm.eg.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_T_UP_simp <- simplify(GO_Tr_Mal_T_UP)
+write.csv(GO_Tr_Mal_T_UP_simp, "results/Male_Thorax/UP_GO.csv")
+
+  
+GO_Tr_Mal_T_DOWN <- enrichGO(row.names(downreg_Mal_T), OrgDb=org.Dm.eg.db, universe = gene_universe_mt, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_T_DOWN_simp <- simplify(GO_Tr_Mal_T_DOWN)
+write.csv(GO_Tr_Mal_T_DOWN_simp, "results/Male_Thorax/DOWN_GO.csv")
+```
+
+
+```{r, fig.height=10, fig.width=10}
+# Define color palette 
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+# Create the bar plot
+mal_th_plot <- as.data.frame(GO_Tr_Mal_T_UP_simp) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n = 10) %>%
+  bind_rows(as.data.frame(GO_Tr_Mal_T_DOWN_simp) %>%
+              slice_min(p.adjust, n = 10) %>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated', -1, 1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_manual(values = colp) +  # Use custom color palette
+  ylab('log10 FDR') + xlab('Ontology') +
+  coord_flip() +
+  ggtitle('Male Thorax') +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+
+    legend.position = "top",
+    
+    axis.text.x = element_text(size = 20),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.y = element_text(size = 20),  #y-axis title
+    axis.title.x = element_text(size = 20),  #x-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 15),  #legend text
+  ) 
+
+mal_th_plot
+```
+
+## Female Abdomen
+
+```{r subset count data to female abdomen}
+cts_fa <- cts[,substring(colnames(cts), 3, 3)=="F" & substring(colnames(cts), 5, 5)=="A"] 
+coldata_fa <- coldata[colnames(cts_fa),]
+
+gene_universe_fa <- rownames(cts[rowSums(cts_fa)>0, ])
+length(gene_universe_fa)
+
+ifelse(!dir.exists("results/Female_Abdomen"), dir.create("results/Female_Abdomen", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_fa, "results/Female_Abdomen/gene_universe_fa.txt")
+
+go_annotations_fa <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_fa)
+
+#columns of abe count matrix and abe rows of abe column data (information about samples) must be abe same so check:
+all(rownames(coldata_fa) %in% colnames(cts_fa)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_fa) == colnames(cts_fa)) #are abey in abe same order?
+```
+
+### DESeqDataSet Object 
+
+```{r make a new DESeqDataSet for female abdomen}
+dds_fa <- DESeqDataSetFromMatrix(countData = cts_fa,
+                              colData = coldata_fa,
+                              design = ~ Species + Treatment) 
+
+keep <- rowSums(counts(dds_fa)) >= 1 #minimal pre-filtering
+dds_fa <- dds_fa[keep,]
+```
+
+### Female Abdomen MDS
+
+```{r, fig.width=8, fig.height=6}
+
+vst_fa <- vst(dds_fa, blind = TRUE)
+
+sampleDists <- dist(t(assay(vst_fa))) 
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+
+mds <- cbind(as.data.frame(colData(vst_fa)), mds_dist$points)
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by abe first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by abe second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+
+fa_mds <- ggplot(mds, aes(x = `1`, y = `2`, color = Treatment , shape = Species)) +
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("Dim 1 (",Dim1,"%)")) +
+  ylab(paste0("Dim 2 (",Dim2,"%)")) +
+  ggtitle("MDS Female Abdomen")+ 
+  theme_minimal() + scale_color_brewer(palette = "Set1")
+```
+
+
+### Differential expression analysis
+
+```{r differential expression analysis: female abdomen}
+dds_fa <- DESeq(dds_fa)
+resultsNames(dds_fa)
+```
+
+### Treatment contrast female abdomen
+
+```{r treatment DEGs female abdomen}
+res_Tr_Fem_A <- results(dds_fa, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh,filterFun=ihw,
+               contrast=c("Treatment","Rapa","Control"))
+summary(res_Tr_Fem_A)
+saveRDS(res_Tr_Fem_A, "results/Female_Abdomen/res_Tr_Fem_A.rds")
+res_Tr_Fem_A_Ordered <- res_Tr_Fem_A[order(res_Tr_Fem_A$pvalue),]
+res_Tr_Fem_A_Sig <- subset(res_Tr_Fem_A_Ordered, padj < FDR.Thresh)
+
+write.csv(res_Tr_Fem_A_Sig, "results/Female_Abdomen/rapa.csv")
+```
+### GO enrichment Female Abdomen
+
+```{r, fig.height=9, fig.width=10}
+GO_Tr_Fem_A <- enrichGO(row.names(res_Tr_Fem_A_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_A_simp <- simplify(GO_Tr_Fem_A, cutoff = .7)
+
+upreg_Fem_A <- subset(res_Tr_Fem_A_Sig, log2FoldChange>0)
+downreg_Fem_A <- subset(res_Tr_Fem_A_Sig, log2FoldChange<0)
+
+GO_Tr_Fem_A_UP <- enrichGO(row.names(upreg_Fem_A), OrgDb=org.Dm.eg.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_A_UP_simp <- simplify(GO_Tr_Fem_A_UP)
+write.csv(GO_Tr_Fem_A_UP_simp, "results/Female_Abdomen/UP_GO.csv")
+
+GO_Tr_Fem_A_DOWN <- enrichGO(row.names(downreg_Fem_A), OrgDb=org.Dm.eg.db, universe = gene_universe_fa, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Fem_A_DOWN_simp <- simplify(GO_Tr_Fem_A_DOWN)
+write.csv(GO_Tr_Fem_A_DOWN_simp, "results/Female_Abdomen/DOWN_GO.csv")
+```
+
+```{r, fig.height=10, fig.width=10}
+# Define color palette 
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+# Create the bar plot
+fem_ab_plot <- as.data.frame(GO_Tr_Fem_A_UP_simp) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n = 10) %>%
+  bind_rows(as.data.frame(GO_Tr_Fem_A_DOWN_simp) %>%
+              slice_min(p.adjust, n = 10) %>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated', -1, 1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  # Set bar color and width
+  scale_fill_manual(values = colp) +  # Use custom color palette
+  ylab('log10 FDR') + xlab('Ontology') +
+  coord_flip() +
+  ggtitle('Female Abdomen') +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  # Use minimal theme
+  theme(
+
+    legend.position = "top",
+    
+    axis.text.x = element_text(size = 20),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.y = element_text(size = 20),  #y-axis title
+    axis.title.x = element_text(size = 20),  #x-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 15),  #legend text
+  ) 
+
+fem_ab_plot
+```
+
+## Male Abdomen
+
+```{r subset count data to male abdomen}
+
+cts_ma <- cts[,substring(colnames(cts), 3, 3)=="M" & substring(colnames(cts), 5, 5)=="A"] 
+coldata_ma <- coldata[colnames(cts_ma),]
+
+gene_universe_ma <- rownames(cts[rowSums(cts_ma)>0, ])
+length(gene_universe_ma)
+
+ifelse(!dir.exists("results/Male_Abdomen"), dir.create("results/Male_Abdomen", recursive=TRUE), print("directory already exists"))
+writeLines(gene_universe_ma, "results/Male_Abdomen/gene_universe_ma.txt")
+
+go_annotations_ma <- go_annotations %>%
+  dplyr::filter(FLYBASE %in% gene_universe_ma)
+
+#columns of abe count matrix and abe rows of abe column data (information about samples) must be abe same so check:
+all(rownames(coldata_ma) %in% colnames(cts_ma)) #all rownames of coldate match colnames of count matrix
+all(rownames(coldata_ma) == colnames(cts_ma)) #are abey in abe same order?
+```
+
+### DESeqDataSet Object 
+```{r make a new DESeqDataSet for male abdomen}
+dds_ma <- DESeqDataSetFromMatrix(countData = cts_ma,
+                              colData = coldata_ma,
+                              design = ~ Species + Treatment) 
+
+keep <- rowSums(counts(dds_ma)) >= 1 #minimal pre-filtering
+dds_ma <- dds_ma[keep,]
+```
+
+### Male Abdomen MDS
+
+```{r, fig.width=8, fig.height=6}
+
+vst_ma <- vst(dds_ma, blind = TRUE)
+
+sampleDists <- dist(t(assay(vst_ma))) 
+
+#dist computes abe euclidean distance matrix.
+
+sampleDistMatrix <- as.matrix(sampleDists)
+mds_dist <- cmdscale(sampleDistMatrix, eig = TRUE)
+#cmdscale: takes a set of dissimilarities (euclidean distances) and returns a set of points such abat abe distances between abe points are approximately equal to abe dissimilarities
+
+mds <- cbind(as.data.frame(colData(vst_ma)), mds_dist$points)
+
+Dim1 <- mds_dist$eig[1]/sum(mds_dist$eig) * 100 # percentage variation explained by abe first dimension (first eigenvalue)
+Dim1 <- signif(Dim1, digits = 4)
+Dim2 <- mds_dist$eig[2]/sum(mds_dist$eig) * 100 # percentage variation explained by abe second dimension (second eigenvalue)
+Dim2 <- signif(Dim2, digits = 4)
+
+mds$name = paste0(mds$Group, mds$Replicate)
+
+ma_mds <- ggplot(mds, aes(x = `1`, y = `2`, color = Treatment , shape = Species)) +
+  geom_point(size = 3) + coord_fixed() + 
+  xlab(paste0("Dim 1 (",Dim1,"%)")) +
+  ylab(paste0("Dim 2 (",Dim2,"%)")) +
+  ggtitle("MDS Male Abdomen")+ 
+  theme_minimal() + scale_color_brewer(palette = "Set1")
+```
+
+
+### Differential expression analysis
+
+```{r differential expression analysis: male abdomen}
+dds_ma <- DESeq(dds_ma)
+resultsNames(dds_ma)
+```
+
+### Treatment contrast male abdomen
+
+```{r treatment DEGs male abdomen}
+res_Tr_Mal_A <- results(dds_ma, alpha = FDR.Thresh, lfcThreshold = LFC.Thresh, filterFun=ihw,
+                        contrast=c("Treatment","Rapa","Control"))
+saveRDS(res_Tr_Mal_A, "results/Male_Abdomen/res_Tr_Mal_A.rds.rds")
+
+summary(res_Tr_Mal_A)
+res_Tr_Mal_A_Ordered <- res_Tr_Mal_A[order(res_Tr_Mal_A$pvalue),]
+res_Tr_Mal_A_Sig <- subset(res_Tr_Mal_A_Ordered, padj < FDR.Thresh)
+
+write.csv(res_Tr_Mal_A_Sig, "results/Male_Abdomen/rapa.csv")
+```
+
+### GO enrichment Male Abdomen
+
+```{r, fig.height=9, fig.width=10}
+GO_Tr_Mal_A <- enrichGO(row.names(res_Tr_Mal_A_Sig), OrgDb=org.Dm.eg.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_A_simp <- simplify(GO_Tr_Mal_A, cutoff = .7)
+
+upreg_Mal_A <- subset(res_Tr_Mal_A_Sig, log2FoldChange>0)
+downreg_Mal_A <- subset(res_Tr_Mal_A_Sig, log2FoldChange<0)
+
+GO_Tr_Mal_A_UP <- enrichGO(row.names(upreg_Mal_A), OrgDb=org.Dm.eg.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_A_UP_simp <- simplify(GO_Tr_Mal_A_UP)
+write.csv(GO_Tr_Mal_A_UP_simp, "results/Male_Abdomen/UP_GO.csv")
+
+GO_Tr_Mal_A_DOWN <- enrichGO(row.names(downreg_Mal_A), OrgDb=org.Dm.eg.db, universe = gene_universe_ma, keyType = "FLYBASE", ont = "BP")
+GO_Tr_Mal_A_DOWN_simp <- simplify(GO_Tr_Mal_A_DOWN)
+write.csv(GO_Tr_Mal_A_DOWN_simp, "results/Male_Abdomen/DOWN_GO.csv")
+
+```
+
+```{r, fig.height=10, fig.width=10}
+# Define color palette 
+colp <- c(Upregulated = '#e41a1c', Downregulated = '#377eb8')
+
+# Create the bar plot
+mal_ab_plot <- as.data.frame(GO_Tr_Mal_A_UP_simp) %>%
+  mutate(Effect = 'Upregulated') %>%
+  slice_min(p.adjust, n = 10) %>%
+  bind_rows(as.data.frame(GO_Tr_Mal_A_DOWN_simp) %>%
+              slice_min(p.adjust, n = 10) %>%
+              mutate(Effect = 'Downregulated')) %>%
+  mutate(p.adjust = log10(p.adjust)) %>%
+  mutate(Direction = if_else(Effect == 'Upregulated', -1, 1)) %>%
+  mutate(padj = p.adjust * Direction) %>%
+  arrange(desc(p.adjust)) %>%
+  mutate(Descr = str_wrap(Description, width = 40)) %>%
+  ggplot(aes(fct_reorder(Descr, p.adjust), padj, fill = Effect)) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.8) +  
+  scale_fill_manual(values = colp) +  
+  ylab('log10 FDR') + xlab('Ontology') +
+  coord_flip() +
+  ggtitle('Male Abdomen') +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +  
+  theme(
+
+    legend.position = "top",
+    
+    axis.text.x = element_text(size = 20),  #x-axis
+    axis.text.y = element_text(size = 16),  #y-axis
+    axis.title.y = element_text(size = 20),  #y-axis title
+    axis.title.x = element_text(size = 20),  #x-axis title
+    plot.title = element_text(size = 22),  #plot title
+    legend.text = element_text(size = 15),  #legend text
+  ) 
+
+mal_ab_plot
+```
+
+
+## Overview figures
+
+### 2A: Barplot
+
+```{r}
+
+
+dataframes <- list(Th_Fem_Up=row.names(upreg_Fem_T), 
+                   Th_Fem_Down=row.names(downreg_Fem_T),
+                   Ab_Fem_Up=row.names(upreg_Fem_A), 
+                   Ab_Fem_Down=row.names(downreg_Fem_A),
+                   Hd_Fem_Up=row.names(upreg_Fem_H), 
+                   Hd_Fem_Down=row.names(downreg_Fem_H),
+                   Th_Mal_Up=row.names(upreg_Mal_T), 
+                   Th_Mal_Down=row.names(downreg_Mal_T),
+                   Ab_Mal_Up=row.names(upreg_Mal_A), 
+                   Ab_Mal_Down=row.names(downreg_Mal_A),
+                   Hd_Mal_Up=row.names(upreg_Mal_H), 
+                   Hd_Mal_Down=row.names(downreg_Mal_H))
+
+lengths <- sapply(dataframes, function(df) length(df))
+
+gene_counts <- data.frame(Sample = names(dataframes), GeneCount = lengths)
+
+gene_counts$Tissue <- substring(gene_counts$Sample, 1,2)
+
+gene_counts <- gene_counts %>%
+  mutate(Tissue = ifelse(Tissue=="Th", "Thorax", 
+                         ifelse(Tissue=="Ab", "Abdomen", "Head")))
+
+
+gene_counts$Sex <- substring(gene_counts$Sample, 4, 6)
+gene_counts <- gene_counts %>%
+  mutate(Sex = ifelse(Sex=="Fem", "Female", "Male"))
+
+gene_counts$Direction <- ifelse(substring(gene_counts$Sample, first=8) == "Up", "Upregulated", "Downregulated")
+
+gene_counts$Direction <- as.factor(gene_counts$Direction)
+gene_counts$Direction <- factor(gene_counts$Direction, levels = c("Upregulated", "Downregulated"))
+
+
+gene_counts$SexTissue <- paste(gene_counts$Sex, gene_counts$Tissue, sep = "\n")
+```
+
+
+```{r}
+# Define custom colors for the Direction variable
+colors <- c("Downregulated" = "#377eb8", "Upregulated" = "#e41a1c")
+
+# Create the bar plot
+Barplot <- ggplot(gene_counts, aes(x = SexTissue, y = GeneCount, fill = Direction)) +
+  geom_bar(stat = "identity", color = "black", width = 0.7) +
+  geom_text(aes(label = GeneCount), position = position_stack(vjust = 0.5), color = "black", size = 5, fontface = "bold") +
+  
+  # Custom color scale
+  scale_fill_manual(values = colors) +
+  
+  # Labels and titles
+  labs(x = "Tissue", y = "DEG count", fill = "Direction") +
+  guides(fill = guide_legend(title = NULL)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    legend.position = "top",
+    axis.title.x = element_blank()
+  ) +
+    scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+
+ggsave("barplot_rapa_effect.pdf", 
+       Barplot,
+       width = 7,
+       height = 7)
+```
+
+
+### 2B: Upset
+
+```{r}
+rapa_ef <- list('Abdomen.Male' = row.names(res_Tr_Mal_A_Sig),
+                'Thorax.Male' = row.names(res_Tr_Mal_T_Sig),
+                'Head.Male' = row.names(res_Tr_Mal_H_Sig),
+                'Abdomen.Female' = row.names(res_Tr_Fem_A_Sig),
+                'Thorax.Female' = row.names(res_Tr_Fem_T_Sig),
+                'Head.Female' = row.names(res_Tr_Fem_H_Sig))
+
+
+pdf(file="rapa_ef_upset.pdf",onefile=FALSE) 
+ upset(
+                                fromList(rapa_ef),
+                                nsets = 6,
+                                intersections=list(list('Abdomen.Female'),
+                                                   list('Thorax.Female'),
+                                                   list('Head.Female'),
+                                                   list('Abdomen.Male'),
+                                                   list('Thorax.Male'),
+                                                   list('Head.Male'),
+                                                   list('Abdomen.Female', 'Thorax.Female' ,'Head.Female'),
+                                                   list('Abdomen.Female', 'Thorax.Female'),
+                                                   list('Abdomen.Female', 'Head.Female'),
+                                                   list('Thorax.Female' ,'Head.Female'),
+                                                   list('Abdomen.Male', 'Thorax.Male'),
+                                                   list('Abdomen.Male', 'Head.Male'),
+                                                   list('Thorax.Male' ,'Head.Male'),
+                                                   list('Abdomen.Male', 'Abdomen.Female'),
+                                                   list('Head.Male', 'Head.Female'),
+                                                   list('Thorax.Male' ,'Thorax.Female'),
+                                                   list('Abdomen.Male' ,'Thorax.Male', 'Head.Male')),
+                                group.by=c("degree"),
+                                main.bar.color = "#984ea3", 
+                                sets.bar.color = "#ff7f00",
+                                matrix.color = "#984ea3",
+                                att.color = "black",
+                                text.scale = 1.4,
+                                set_size.show=TRUE, keep.order=TRUE,
+                                order.by = c( "degree"),
+                                decreasing=F,
+                                set_size.scale_max = 7500,
+                                point.size = 2.8
+                                )
+
+dev.off()
+```
+
+### SupplementalGO enrichment
+
+```{r}
+
+rapa_GO_enrichment_head <- cowplot::plot_grid(fem_hd_plot, mal_hd_plot,
+                                           ncol=1, labels=c("A", "B"), 
+                                           label_size=25)   
+ggsave("rapa_GO_enrichment_head.pdf", plot = rapa_GO_enrichment_head, width = 12, height = 20, dpi = 300)
+
+
+rapa_GO_enrichment_thorax <- cowplot::plot_grid(fem_th_plot, mal_th_plot,
+                                           ncol=1, labels=c("A", "B"), 
+                                           label_size=25)   
+ggsave("rapa_GO_enrichment_thorax.pdf", plot = rapa_GO_enrichment_thorax, width = 12, height = 20, dpi = 300)
+
+rapa_GO_enrichment_abdomen <- cowplot::plot_grid(fem_ab_plot, mal_ab_plot,
+                                           ncol=1, labels=c("A", "B"), 
+                                           label_size=25)   
+ggsave("rapa_GO_enrichment_abdomen.pdf", plot = rapa_GO_enrichment_abdomen, width = 12, height = 20, dpi = 300)
+```
+
+
+```{r session_info}
+devtools::session_info()
+```
+
+This document was processed on: `r Sys.Date()`
